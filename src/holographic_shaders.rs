@@ -53,8 +53,10 @@ pub struct HoloPipelines {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TileUniforms {
-    pub dmin_world: [f32; 2],
-    pub dmax_world: [f32; 2],
+    pub dmin_world: [f32; 2],    // 8 bytes
+    pub dmax_world: [f32; 2],    // 8 bytes
+    pub z_bias: f32,             // 4 bytes
+    pub _padding: [u32; 11],     // 44 bytes (pad to 64 bytes total)
 }
 
 #[repr(C)]
@@ -381,6 +383,10 @@ struct UBO {
 struct TileUBO {
     dmin_world: vec2<f32>,   // tile decode XY mapped to world meters (min)
     dmax_world: vec2<f32>,   // tile decode XY mapped to world meters (max)
+    z_bias: f32,
+    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
+    _pad4: u32, _pad5: u32, _pad6: u32, _pad7: u32,
+    _pad8: u32, _pad9: u32, _pad10: u32,
 };
 @group(1) @binding(0) var<uniform> T: TileUBO;
 
@@ -396,7 +402,8 @@ struct VSOut {
 
 @vertex
 fn vs_main(in: VSIn) -> VSOut {
-    let world = in.center;
+    // Apply per-tile vertical bias before any depth/size work.
+    let world = vec3<f32>(in.center.xy, in.center.z + T.z_bias);
 
     // Transform to view space
     let view_pos = U.view * vec4<f32>(world, 1.0);

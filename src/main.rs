@@ -226,6 +226,10 @@ struct App {
     mouse_down: bool,
     last_mouse: Option<(f64, f64)>,
 
+    // Zoom
+    zoom_factor: f32,
+    default_distance: f32,
+
     // Time
     start: Instant,
 
@@ -615,6 +619,8 @@ impl App {
             last_mouse: None,
             start: Instant::now(),
             grid_enabled: true,
+            zoom_factor: 1.0,
+            default_distance: 500.0, // reasonable default distance
         }
     }
 
@@ -801,12 +807,16 @@ impl App {
             let tile_u = holographic_shaders::TileUniforms {
                 dmin_world: [dmin_world.x, dmin_world.y],
                 dmax_world: [dmax_world.x, dmax_world.y],
+                z_bias: 0.0,
+                _padding: [0u32; 11],
             };
+
             let tile_ubo = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(&format!("Tile UBO ({})", l.name)),
                 contents: bytemuck::bytes_of(&tile_u),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
+
             let tile_bg = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Holo BG (tile)"),
                 layout: &self.holo.bgl_tile,
@@ -836,18 +846,21 @@ impl App {
         // Compute Z-biases for consistent cross-tile altitudes
         let z_biases = compute_z_biases(&tiles);
 
-        // Apply Z-biases and recompute world bounds
+        // Apply Z-biases and update per-tile UBOs so the shader sees them
         for (i, tile) in tiles.iter_mut().enumerate() {
             if i < z_biases.len() {
                 tile.z_bias = z_biases[i];
 
-                // Update vertex buffer with Z-bias applied
-                if tile.z_bias != 0.0 {
-                    // Need to reload positions and apply bias
-                    // For now, we'll skip this complex step and just store the bias
-                    // The bias could be applied in the shader or via a transform
-                    log::info!("Applied Z-bias {} to tile {}", tile.z_bias, tile.name);
-                }
+                let tu = holographic_shaders::TileUniforms {
+                    dmin_world: [tile.dmin_world.x, tile.dmin_world.y],
+                    dmax_world: [tile.dmax_world.x, tile.dmax_world.y],
+                    z_bias: tile.z_bias,
+                    _padding: [0u32; 11],
+                };
+
+                self.gpu
+                    .queue
+                    .write_buffer(&tile.tile_ubo, 0, bytemuck::bytes_of(&tu));
             }
         }
 
@@ -876,6 +889,7 @@ impl App {
         let size = self.world_max - self.world_min;
         let max_dim = size.x.max(size.y).max(size.z);
         let dist = max_dim * 1.2;
+        self.default_distance = dist; // Store default distance for zoom reset
         let center = 0.5 * (self.world_min + self.world_max);
         self.cam_target = center;
         self.cam_up = Vec3::new(0.0, 0.0, 1.0);
@@ -1048,11 +1062,10 @@ impl App {
 
     fn snap_north_up(&mut self) {
         self.cam_up = Vec3::new(0.0, 0.0, 1.0);
+        self.zoom_factor = 1.0; // Reset zoom
 
         if !self.tiles.is_empty() {
-            let size = self.world_max - self.world_min;
-            let max_dim = size.x.max(size.y).max(size.z);
-            let dist = max_dim * 1.2;
+            let dist = self.default_distance;
             let center = 0.5 * (self.world_min + self.world_max);
             self.cam_target = center;
             self.cam_pos = center + Vec3::new(0.0, -dist * 1.35, dist * 0.9);
@@ -1080,6 +1093,46 @@ impl App {
         if btn == MouseButton::Left {
             self.mouse_down =
                 state == ElementState::Pressed;
+        }
+    }
+
+    fn handle_scroll(&mut self, delta: f32) {
+        // Exponential dolly zoom: positive delta -> zoom in, negative -> zoom out.
+        // Winit docs: positive scroll on Pixel/Line delta means "content moves right/down"
+        // (we invert with the minus sign so positive delta zooms IN).  [oai_citation:2‡Docs.rs](https://docs.rs/winit-gtk/latest/winit/event/enum.MouseScrollDelta.html?utm_source=chatgpt.com)
+        const ZOOM_STEP: f32 = 1.20; // ~20% per notch
+        let scale = ZOOM_STEP.powf(-delta); // >1 => out, <1 => in
+
+        // Work in offset space to avoid normalizing near zero distance.
+        let mut offset = self.cam_pos - self.cam_target; // world units (meters)
+        let old_len = offset.length();
+
+        // If degenerate, pick a stable fallback direction (-Y) with a reasonable radius.
+        if old_len < 1e-6 {
+            let fallback = (self.default_distance).max(self.near * 2.0);
+            offset = glam::Vec3::new(0.0, -1.0, 0.0) * fallback;
+        }
+
+        // Apply zoom scale.
+        offset *= scale;
+
+        // Clamp to the frustum range to avoid crossing the near/far planes.
+        let mut new_len = offset.length();
+        let min_d = (self.near * 2.0).max(0.10);   // stay away from near plane
+        let max_d = (self.far * 0.90).max(min_d);  // keep some headroom to far plane
+        if new_len < min_d {
+            let dir = offset / new_len.max(1e-6);
+            offset = dir * min_d;
+            new_len = min_d;
+        } else if new_len > max_d {
+            offset = offset / new_len * max_d;
+            new_len = max_d;
+        }
+
+        // Update camera and UI zoom factor.
+        self.cam_pos = self.cam_target + offset;
+        if self.default_distance > 0.0 {
+            self.zoom_factor = self.default_distance / new_len;
         }
     }
 
@@ -1135,16 +1188,12 @@ impl App {
                         dir,
                     );
 
-                let dist =
-                    (
-                        self.cam_pos
-                        - self.cam_target
-                    ).length();
+                let current_dist = (self.cam_pos - self.cam_target).length();
 
                 self.cam_pos =
                     self.cam_target
                     - dir
-                    * dist;
+                    * current_dist;
             }
         }
 
@@ -1622,6 +1671,14 @@ fn main() -> Result<()> {
                                         position.y,
                                     ),
                                 );
+                            }
+                            WindowEvent::MouseWheel { delta, .. } => {
+                                let scroll_delta = match delta {
+                                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                                    // Approximate: 120 px per wheel "notch" on Windows; device-dependent elsewhere.
+                                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.y as f32) / 120.0,
+                                };
+                                app.handle_scroll(scroll_delta);
                             }
                             WindowEvent::DroppedFile(_path) => {
                                 // This functionality is now handled by build_all_tiles on startup.
