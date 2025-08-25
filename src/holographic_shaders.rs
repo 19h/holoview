@@ -46,6 +46,7 @@ pub struct HoloPipelines {
     pub uniform_buffer: wgpu::Buffer,
     pub quad_vb: wgpu::Buffer,
     pub uniforms: HoloUniforms,
+    pub bgl: wgpu::BindGroupLayout,
 }
 
 #[repr(C)]
@@ -285,6 +286,7 @@ impl HoloPipelines {
             uniform_buffer,
             quad_vb,
             uniforms,
+            bgl,
         }
     }
 
@@ -297,37 +299,7 @@ impl HoloPipelines {
         // Rebuild the bind group with the same UBO but new texture & sampler
         self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Holo BG (with SMC1)"),
-            layout: &device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Holo BGL (mirror)"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                        count: None,
-                    },
-                ],
-            }),
+            layout: &self.bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -343,6 +315,19 @@ impl HoloPipelines {
                 },
             ],
         });
+    }
+
+    /// NEW: build a per‑tile bind group (UBO shared, semantics specific).
+    pub fn bind_group_for_semantics(&self, device: &wgpu::Device, sem_view: &wgpu::TextureView, sem_sampler: &wgpu::Sampler) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Holo BG (tile)"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(sem_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sem_sampler) },
+            ],
+        })
     }
 
     pub fn update_uniforms(&mut self, queue: &wgpu::Queue, u: HoloUniforms) {

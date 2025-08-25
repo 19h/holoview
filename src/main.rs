@@ -18,8 +18,9 @@ use winit::{
 };
 
 use holographic_shaders::{HoloPipelines, HoloUniforms};
-use point_cloud::QuantizedPointCloud;
+use point_cloud::{QuantizedPointCloud, GeoExtentDeg};
 use post::{EdlPass, EdlUniforms, RgbShiftPass, RgbShiftUniforms, CrtPass, CrtUniforms};
+use walkdir::WalkDir;
 
 // WGPU (Vulkan/D3D) clip-space conversion for a GL-style projection
 const OPENGL_TO_WGPU_MATRIX: Mat4 = Mat4::from_cols_array(&[
@@ -31,6 +32,15 @@ const OPENGL_TO_WGPU_MATRIX: Mat4 = Mat4::from_cols_array(&[
 
 // Multi-sampling sample count for anti-aliasing
 const SAMPLE_COUNT: u32 = 4;
+
+fn meters_per_deg_lat(lat_deg: f64) -> f64 {
+    let φ = lat_deg.to_radians();
+    111_132.92 - 559.82 * (2.0*φ).cos() + 1.175 * (4.0*φ).cos() - 0.0023 * (6.0*φ).cos()
+}
+fn meters_per_deg_lon(lat_deg: f64) -> f64 {
+    let φ = lat_deg.to_radians();
+    111_412.84 * φ.cos() - 93.5 * (3.0*φ).cos() + 0.118 * (5.0*φ).cos()
+}
 
 struct Gpu {
     surface: wgpu::Surface<'static>,
@@ -61,6 +71,21 @@ struct Targets {
     nearest_samp: wgpu::Sampler,
 }
 
+struct TileDraw {
+    name: String,
+    vb: wgpu::Buffer,
+    count: u32,
+    // semantics
+    sem_tex: Option<wgpu::Texture>,
+    sem_view: wgpu::TextureView,
+    sem_samp: wgpu::Sampler,
+    holo_bg: wgpu::BindGroup,
+    // per‑tile world decode bounds for SMC1 UV & height modulation
+    dmin_world: Vec3,
+    dmax_world: Vec3,
+    geot: GeoExtentDeg,
+}
+
 struct App {
     gpu: Gpu,
     window: Arc<Window>,
@@ -77,14 +102,20 @@ struct App {
     crt: CrtPass,
     grid: ground_grid::GroundGrid,
 
-    // Data
-    instances: Option<wgpu::Buffer>,
-    instance_count: u32,
-    cloud: Option<QuantizedPointCloud>,
-
-    sem_tex: Option<wgpu::Texture>,
-    sem_view: Option<wgpu::TextureView>,
-    sem_samp: Option<wgpu::Sampler>,
+    // Multi‑tile dataset
+    tiles: Vec<TileDraw>,
+    world_min: Vec3,
+    world_max: Vec3,
+    geot_union: Option<GeoExtentDeg>,
+    // global geodetic anchor and scale
+    lon0: f64,
+    lat0: f64,
+    mdeg_lon_ref: f64,
+    mdeg_lat_ref: f64,
+    // Fallback SMC1 (1×1 zero)
+    sem_fallback_tex: wgpu::Texture,
+    sem_fallback_view: wgpu::TextureView,
+    sem_fallback_samp: wgpu::Sampler,
 
     // Targets
     tgt: Targets,
@@ -432,6 +463,30 @@ impl App {
                 wgpu::TextureFormat::Rgba16Float,
             );
 
+        // Fallback SMC1 resources
+        let sem_fallback_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SMC1 Fallback 1x1"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        gpu.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &sem_fallback_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All
+            },
+            &[0u8], // label=0 → Unknown
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(1), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }
+        );
+        let sem_fallback_view = sem_fallback_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let sem_fallback_samp = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("SMC1 Fallback Sampler"), mag_filter: wgpu::FilterMode::Nearest, min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest, address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge, address_mode_w: wgpu::AddressMode::ClampToEdge, ..Default::default()
+        });
+
         Self {
             gpu,
             window,
@@ -443,12 +498,17 @@ impl App {
             rgb,
             crt,
             grid,
-            instances: None,
-            instance_count: 0,
-            cloud: None,
-            sem_tex: None,
-            sem_view: None,
-            sem_samp: None,
+            tiles: Vec::new(),
+            world_min: Vec3::ZERO,
+            world_max: Vec3::ONE,
+            geot_union: None,
+            lon0: 0.0,
+            lat0: 0.0,
+            mdeg_lon_ref: 111_320.0,
+            mdeg_lat_ref: 110_574.0,
+            sem_fallback_tex,
+            sem_fallback_view,
+            sem_fallback_samp,
             tgt,
             // camera (Z-up)
             cam_pos:    Vec3::new(0.0, -350.0, 220.0), // south & above
@@ -464,105 +524,205 @@ impl App {
         }
     }
 
-    fn resolve_default_cloud() -> Option<String> {
-        let candidates = [
-            "../hypc/Tile-58-52-1-1.hypc",
-            "hypc/Tile-58-52-1-1.hypc",
-            "../hypc/Tile-58-52-1-1.ply",
-            "hypc/Tile-58-52-1-1.ply",
-        ];
+    fn upload_semantic_mask_to_texture(&self, sm: &point_cloud::SemanticMask) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
+        let w = sm.width as u32;
+        let h = sm.height as u32;
+        let tex = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SMC1 Labels"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
 
-        for p in candidates {
-            if std::path::Path::new(p).exists() {
-                return Some(p.to_string());
+        // 256‑byte aligned rows
+        let bpr = ((w + 255) / 256) * 256;
+        let mut staging = vec![0u8; (bpr * h) as usize];
+        for row in 0..h as usize {
+            let src = &sm.data[row * w as usize .. (row + 1) * w as usize];
+            let dst = &mut staging[row * bpr as usize .. row * bpr as usize + w as usize];
+            dst.copy_from_slice(src);
+        }
+
+        self.gpu.queue.write_texture(
+            wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &staging,
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let samp = self.gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("SMC1 Nearest"),
+            mag_filter: wgpu::FilterMode::Nearest, min_filter: wgpu::FilterMode::Nearest, mipmap_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, address_mode_w: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        (tex, view, samp)
+    }
+
+    fn scan_hypc_files(root: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for e in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if e.file_type().is_file() {
+                if let Some(ext) = e.path().extension().and_then(|s| s.to_str()) {
+                    if ext.eq_ignore_ascii_case("hypc") {
+                        out.push(e.path().to_string_lossy().to_string());
+                    }
+                }
             }
         }
-
-        None
+        out
     }
 
-    fn load_cloud_into_gpu(&mut self, cloud: QuantizedPointCloud) -> Result<()> {
-        use holographic_shaders::Instance;
+    fn build_all_tiles(&mut self, root: &str) -> anyhow::Result<()> {
+        let paths = Self::scan_hypc_files(root);
+        if paths.is_empty() { return Ok(()); }
 
-        // instance buffer
-        let instances: Vec<Instance> =
-            cloud.positions
-                .iter()
-                .map(|p| Instance {
-                    position: [p.x, p.y, p.z],
-                })
-                .collect();
-
-        let vb =
-            self.gpu.device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: Some("Instances"),
-                    contents: bytemuck::cast_slice(&instances),
-                    usage: wgpu::BufferUsages::VERTEX,
+        // 1) Load all tiles with GEOT
+        struct Loaded { name: String, pc: QuantizedPointCloud }
+        let mut loaded = Vec::<Loaded>::new();
+        for p in paths {
+            match QuantizedPointCloud::load_hypc(&p) {
+                Ok(pc) => {
+                    if pc.geog_bbox_deg.is_some() {
+                        loaded.push(Loaded { name: std::path::Path::new(&p).file_name().unwrap().to_string_lossy().to_string(), pc });
+                    } else {
+                        log::warn!("Skipping {}: no GEOT footer", p);
+                    }
                 }
+                Err(e) => log::warn!("Skipping {}: {}", p, e),
+            }
+        }
+        if loaded.is_empty() { return Ok(()); }
+
+        // 2) Union GEOT and anchor
+        let mut g = GeoExtentDeg { lon_min: f64::INFINITY, lat_min: f64::INFINITY, lon_max: f64::NEG_INFINITY, lat_max: f64::NEG_INFINITY };
+        for l in &loaded {
+            let bb = l.pc.geog_bbox_deg.as_ref().unwrap();
+            g.lon_min = g.lon_min.min(bb.lon_min);
+            g.lon_max = g.lon_max.max(bb.lon_max);
+            g.lat_min = g.lat_min.min(bb.lat_min);
+            g.lat_max = g.lat_max.max(bb.lat_max);
+        }
+        self.lon0 = 0.5 * (g.lon_min + g.lon_max);
+        self.lat0 = 0.5 * (g.lat_min + g.lat_max);
+        self.mdeg_lon_ref = meters_per_deg_lon(self.lat0);
+        self.mdeg_lat_ref = meters_per_deg_lat(self.lat0);
+        self.geot_union = Some(g);
+
+        // 3) Per‑tile transform to world (meters), build GPU buffers and per‑tile bind groups
+        let mut tiles = Vec::<TileDraw>::new();
+        let mut wmin = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+        let mut wmax = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+
+        use holographic_shaders::Instance;
+        for l in loaded {
+            let pc = l.pc;
+            let geot = pc.geog_bbox_deg.clone().unwrap();
+            let dmin = pc.decode_min;
+            let dmax = pc.decode_max;
+
+            let lat_c = 0.5 * (geot.lat_min + geot.lat_max);
+            let mdeg_lon_tile = meters_per_deg_lon(lat_c);
+            let mdeg_lat_tile = meters_per_deg_lat(lat_c);
+
+            let dx = (dmax.x - dmin.x).max(f32::EPSILON);
+            let dy = (dmax.y - dmin.y).max(f32::EPSILON);
+
+            let lon_span = (geot.lon_max - geot.lon_min).max(f64::EPSILON);
+            let lat_span = (geot.lat_max - geot.lat_min).max(f64::EPSILON);
+
+            let sx = (lon_span * mdeg_lon_tile) as f32 / dx;
+            let sy = (lat_span * mdeg_lat_tile) as f32 / dy;
+            let sz = 0.5 * (sx + sy); // isotropic vertical per A4
+
+            let mut inst = Vec::<Instance>::with_capacity(pc.positions.len());
+            for p in &pc.positions {
+                // decode‑XY -> lon/lat
+                let lon = geot.lon_min + ((p.x - dmin.x) as f64 / dx as f64) * lon_span;
+                let lat = geot.lat_min + ((p.y - dmin.y) as f64 / dy as f64) * lat_span;
+                // lon/lat -> world meters about (lon0,lat0)
+                let x_world = ((lon - self.lon0) * self.mdeg_lon_ref) as f32;
+                let y_world = ((lat - self.lat0) * self.mdeg_lat_ref) as f32;
+                let z_world = (p.z - dmin.z) * sz;
+
+                inst.push(Instance { position: [x_world, y_world, z_world] });
+
+                wmin.x = wmin.x.min(x_world); wmin.y = wmin.y.min(y_world); wmin.z = wmin.z.min(z_world);
+                wmax.x = wmax.x.max(x_world); wmax.y = wmax.y.max(y_world); wmax.z = wmax.z.max(z_world);
+            }
+
+            let vb = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("Instances({})", l.name)),
+                contents: bytemuck::cast_slice(&inst),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+
+            // per‑tile world decode bounds (for SMC1 UV + height)
+            let dmin_world = Vec3::new(
+                ((geot.lon_min - self.lon0) * self.mdeg_lon_ref) as f32,
+                ((geot.lat_min - self.lat0) * self.mdeg_lat_ref) as f32,
+                0.0
+            );
+            let dmax_world = Vec3::new(
+                ((geot.lon_max - self.lon0) * self.mdeg_lon_ref) as f32,
+                ((geot.lat_max - self.lat0) * self.mdeg_lat_ref) as f32,
+                (dmax.z - dmin.z) * sz
             );
 
-        self.instances = Some(vb);
-        self.instance_count = cloud.kept as u32;
-        self.cloud = Some(cloud);
+            // semantics
+            let (sem_tex, sem_view, sem_samp) = if let Some(sm) = pc.semantic_mask.as_ref() {
+                let (t, v, s) = self.upload_semantic_mask_to_texture(sm);
+                (Some(t), v, s)
+            } else {
+                // Create new references to the fallback texture and sampler
+                let fallback_view = self.sem_fallback_tex.create_view(&wgpu::TextureViewDescriptor::default());
+                let fallback_samp = self.gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("SMC1 Fallback Sampler (copy)"),
+                    mag_filter: wgpu::FilterMode::Nearest,
+                    min_filter: wgpu::FilterMode::Nearest,
+                    mipmap_filter: wgpu::FilterMode::Nearest,
+                    address_mode_u: wgpu::AddressMode::ClampToEdge,
+                    address_mode_v: wgpu::AddressMode::ClampToEdge,
+                    address_mode_w: wgpu::AddressMode::ClampToEdge,
+                    ..Default::default()
+                });
+                (None, fallback_view, fallback_samp)
+            };
 
-        // frame camera (Z-up) from decode bounds
-        if let Some(pc) = &self.cloud {
-            let size = pc.decode_max - pc.decode_min;
+            // per‑tile holo bind group
+            let holo_bg = self.holo.bind_group_for_semantics(&self.gpu.device, &sem_view, &sem_samp);
 
-            let max_dim =
-                size.x
-                    .max(size.y)
-                    .max(size.z);
-
-            let dist = max_dim * 1.2;
-
-            self.cam_up     =
-                glam::Vec3::new(
-                    0.0,
-                    0.0,
-                    1.0,
-                );
-
-            self.cam_target =
-                (pc.decode_min + pc.decode_max)
-                * 0.5;
-
-            self.cam_pos =
-                self.cam_target
-                + glam::Vec3::new(
-                    dist * 0.25,
-                    -dist * 1.35,
-                    dist * 0.9,
-                );
+            tiles.push(TileDraw {
+                name: l.name,
+                vb,
+                count: pc.kept as u32,
+                sem_tex,
+                sem_view,
+                sem_samp,
+                holo_bg,
+                dmin_world,
+                dmax_world,
+                geot,
+            });
         }
 
-        // --- upload SMC1 if present ---
-        // Extract semantic mask to avoid borrowing conflicts
-        let semantic_mask_data = self.cloud.as_ref().and_then(|pc| pc.semantic_mask.clone());
-        if let Some(semantic_mask) = semantic_mask_data.as_ref() {
-            self.upload_semantic_mask(semantic_mask);
-        }
+        self.tiles = tiles;
+        self.world_min = wmin;
+        self.world_max = wmax;
+
+        // Frame camera based on union world bounds (Z‑up)
+        let size = self.world_max - self.world_min;
+        let max_dim = size.x.max(size.y).max(size.z);
+        let dist = max_dim * 1.2;
+        let center = 0.5 * (self.world_min + self.world_max);
+        self.cam_target = center;
+        self.cam_up = Vec3::new(0.0, 0.0, 1.0);
+        self.cam_pos = center + Vec3::new(0.25*dist, -1.35*dist, 0.9*dist);
 
         Ok(())
-    }
-
-    pub fn load_ply(&mut self, path: &str, point_budget: usize, target_extent: f32) -> Result<()> {
-        self.load_cloud_into_gpu(
-            point_cloud::QuantizedPointCloud::load_ply_quantized(
-                path,
-                point_budget,
-                target_extent
-            )?
-        )
-    }
-
-    pub fn load_hypc(&mut self, path: &str) -> Result<()> {
-        self.load_cloud_into_gpu(
-            point_cloud::QuantizedPointCloud::load_hypc(
-                path,
-            )?
-        )
     }
 
     fn update_uniforms(&mut self) {
@@ -588,12 +748,7 @@ impl App {
                 .elapsed()
                 .as_secs_f32();
 
-        let (dmin, dmax) =
-            if let Some(pc) = &self.cloud {
-                (pc.decode_min, pc.decode_max)
-            } else {
-                (Vec3::ZERO, Vec3::ONE)
-            };
+        let (dmin, dmax) = (self.world_min, self.world_max);
 
         let u = HoloUniforms {
             view, proj,
@@ -657,21 +812,18 @@ impl App {
             },
         );
 
-        // Update grid uniforms
-        let mut enable_grid = 0u32;
-        let (lon_min, lat_min, lon_span, lat_span) = if let Some(pc) = &self.cloud {
-            if let Some(bb) = &pc.geog_bbox_deg {
-                enable_grid = if self.grid_enabled { 1 } else { 0 };
-                (bb.lon_min as f32,
-                 bb.lat_min as f32,
-                 (bb.lon_max - bb.lon_min) as f32,
-                 (bb.lat_max - bb.lat_min) as f32)
-            } else { (0.0, 0.0, 0.0, 0.0) }
-        } else { (0.0, 0.0, 0.0, 0.0) };
+        // Grid: use union GEOT + union world bounds
+        let (lon_min, lat_min, lon_span, lat_span, enable_grid) = if let Some(bb) = &self.geot_union {
+            (bb.lon_min as f32,
+             bb.lat_min as f32,
+             (bb.lon_max - bb.lon_min) as f32,
+             (bb.lat_max - bb.lat_min) as f32,
+             if self.grid_enabled { 1u32 } else { 0u32 })
+        } else { (0.0, 0.0, 0.0, 0.0, 0u32) };
 
-        // place the plane slightly below the data to avoid z-fighting
+        // place plane just below global min z
         let extent = (dmax - dmin).abs();
-        let z_ofs = (extent.z.max(1e-6)) * 0.02;
+        let z_ofs = extent.z.max(1e-6) * 0.02;
 
         self.grid.update_uniforms(
             &self.gpu.queue,
@@ -683,7 +835,7 @@ impl App {
                 geot_lat_min: lat_min,
                 geot_lon_span: lon_span,
                 geot_lat_span: lat_span,
-                extent_mul: 12.0,          // larger => "more infinite"
+                extent_mul: 12.0,
                 z_offset: z_ofs,
                 opacity: 0.55,
                 enabled: enable_grid,
@@ -736,38 +888,15 @@ impl App {
     }
 
     fn snap_north_up(&mut self) {
-        self.cam_up =
-            Vec3::new(
-                0.0,
-                0.0,
-                1.0,
-            );
+        self.cam_up = Vec3::new(0.0, 0.0, 1.0);
 
-        if let Some(pc) = &self.cloud {
-            let size =
-                pc.decode_max
-                - pc.decode_min;
-
-            let d =
-                size.x
-                    .max(size.y)
-                    .max(size.z)
-                * 1.2;
-
-            self.cam_target =
-                (
-                    pc.decode_min
-                    + pc.decode_max
-                )
-                * 0.5;
-
-            self.cam_pos =
-                self.cam_target
-                + Vec3::new(
-                    0.0,
-                    -d * 1.35,
-                    d * 0.9,
-                );
+        if !self.tiles.is_empty() {
+            let size = self.world_max - self.world_min;
+            let max_dim = size.x.max(size.y).max(size.z);
+            let dist = max_dim * 1.2;
+            let center = 0.5 * (self.world_min + self.world_max);
+            self.cam_target = center;
+            self.cam_pos = center + Vec3::new(0.0, -dist * 1.35, dist * 0.9);
         }
     }
 
@@ -942,14 +1071,15 @@ impl App {
             rp.set_vertex_buffer(0, self.grid.quad_vb.slice(..));
             rp.draw(0..6, 0..1);
 
-            // then the points (unchanged)
-            if let (Some(inst), n) = (&self.instances, self.instance_count) {
-                rp.set_pipeline(&self.holo.pipeline);
-                rp.set_bind_group(0, &self.holo.bind_group, &[]);
-                rp.set_vertex_buffer(0, self.holo.quad_vb.slice(..));
-                rp.set_vertex_buffer(1, inst.slice(..));
+            // --- draw all tiles ---
+            rp.set_pipeline(&self.holo.pipeline);
+            rp.set_vertex_buffer(0, self.holo.quad_vb.slice(..));
 
-                rp.draw(0..6, 0..n);
+            for t in &self.tiles {
+                // Use pre-built bind groups that already contain the per-tile uniform data
+                rp.set_bind_group(0, &t.holo_bg, &[]);
+                rp.set_vertex_buffer(1, t.vb.slice(..));
+                rp.draw(0..6, 0..t.count);
             }
         }
 
@@ -1127,7 +1257,7 @@ impl App {
                                 .strong()
                         );
 
-                        let pts = self.instance_count;
+                        let pts: u32 = self.tiles.iter().map(|t| t.count).sum();
                         let alt = self.cam_pos.z.round() as i32;
 
                         ui.label(
@@ -1228,68 +1358,6 @@ impl App {
                 );
         }
     }
-
-    fn upload_semantic_mask(&mut self, sm: &point_cloud::SemanticMask) {
-        let w = sm.width as u32;
-        let h = sm.height as u32;
-
-        // Create R8Unorm texture for labels
-        let tex = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("SMC1 Labels"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        // Write with 256-byte row pitch
-        let bytes_per_row = ((w + 255) / 256) * 256;
-        let mut staging = vec![0u8; (bytes_per_row * h) as usize];
-        for row in 0..h as usize {
-            let src = &sm.data[row * w as usize .. (row + 1) * w as usize];
-            let dst = &mut staging[row * bytes_per_row as usize .. row * bytes_per_row as usize + w as usize];
-            dst.copy_from_slice(src);
-        }
-
-        self.gpu.queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &staging,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let samp = self.gpu.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("SMC1 Nearest"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            ..Default::default()
-        });
-
-        // Rebind the Holo pipeline with this texture/sampler
-        self.holo.set_semantics_inputs(&self.gpu.device, &view, &samp);
-
-        // Keep them alive
-        self.sem_tex = Some(tex);
-        self.sem_view = Some(view);
-        self.sem_samp = Some(samp);
-    }
 }
 
 fn main() -> Result<()> {
@@ -1317,13 +1385,11 @@ fn main() -> Result<()> {
             ),
         );
 
-    // Auto-load the point cloud (no drag&drop needed)
-    if let Some(p) = App::resolve_default_cloud() {
-        match std::path::Path::new(&p).extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()) {
-            Some(ref ext) if ext == "hypc" => { let _ = app.load_hypc(&p); }
-            Some(ref ext) if ext == "ply"  => { let _ = app.load_ply(&p, 1_200_000, 200.0); }
-            _ => {}
-        }
+    // Load all .hypc tiles found under ./hypc (or ../hypc)
+    if std::path::Path::new("hypc").exists() {
+        let _ = app.build_all_tiles("hypc");
+    } else if std::path::Path::new("../hypc").exists() {
+        let _ = app.build_all_tiles("../hypc");
     }
 
     event_loop.run(
@@ -1397,35 +1463,9 @@ fn main() -> Result<()> {
                                     ),
                                 );
                             }
-                            // drag&drop still works, but autoload already covers your case
-                            WindowEvent::DroppedFile(path) => {
-                                let ext =
-                                    path.extension()
-                                        .and_then(|e|
-                                            e.to_str()
-                                        )
-                                        .map(|s|
-                                            s.to_ascii_lowercase()
-                                        );
-
-                                match ext.as_deref() {
-                                    Some("hypc") => {
-                                        let _ =
-                                            app.load_hypc(
-                                                path.to_str()
-                                                    .unwrap(),
-                                            );
-                                    }
-                                    Some("ply")  => {
-                                        let _ =
-                                            app.load_ply(
-                                                path.to_str().unwrap(),
-                                                1_200_000,
-                                                200.0,
-                                            );
-                                    }
-                                    _ => {}
-                                }
+                            WindowEvent::DroppedFile(_path) => {
+                                // This functionality is now handled by build_all_tiles on startup.
+                                // Could be re-wired to rebuild the dataset.
                             }
                             _ => {}
                         }
