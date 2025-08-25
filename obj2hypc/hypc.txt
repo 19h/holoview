@@ -1,0 +1,217 @@
+#pragma author ETHOUT
+#pragma description HYPC (HPC1) v1 — points + optional SMC1 + GEOT
+#pragma magic [ 48 50 43 31 ] @ 0x00   // 'H' 'P' 'C' '1'
+#pragma endian little
+
+// Allow large point clouds (e.g., 1–5 million points).
+// Adjust upward if your tiles contain even more.
+#pragma array_limit 5000000
+#pragma pattern_limit 500000000
+
+import std.core;
+import std.io;
+import std.mem;
+import std.string;
+
+using BitfieldOrder = std::core::BitfieldOrder;
+
+// ---------------------------------------------
+// Header flags & tilekey reserved interpretation
+// ---------------------------------------------
+
+bitfield HYPC_FLAGS {
+    tilekey_present : 1;  // FLAG_TILEKEY_PRESENT (1<<0)
+    reserved        : 31;
+} [[bitfield_order(BitfieldOrder::LeastToMostSignificant, 32)]];
+
+enum KeyType : u8 { XY = 0, NameHash64 = 4 };
+
+struct HYPC_RESERVED_XY {
+    u8  zoom;
+    u32 x;
+    u32 y;
+    u8  scheme;   // dataset-defined scheme id
+} [[static]];
+
+struct HYPC_RESERVED_HASH {
+    u64 name_hash;   // FNV-1a 64 (LE as written)
+    u8  rsvd[2];     // trailing bytes
+} [[static]];
+
+struct HYPC_RESERVED {
+    u8 key_type;
+    match (key_type) {
+        (KeyType::XY):         HYPC_RESERVED_XY   data [[inline]];   // + key_type = 11 B
+        (KeyType::NameHash64): HYPC_RESERVED_HASH data [[inline]];   // + key_type = 11 B
+        (_):                   u8 raw[10];                            // + key_type = 11 B
+    }
+} [[static]];
+
+// ---------------------------------------------
+// HYPC header
+// ---------------------------------------------
+
+fn u64_min(u64 a, u64 b) { return a < b ? a : b; };
+
+struct HYPC_HEADER {
+    char magic[4];            // "HPC1"
+    u32  version;             // 1
+    HYPC_FLAGS flags;         // bit 0 => reserved encodes a tile key
+    u32  count;               // #points after quantization/downsample
+    u8   quant_bits;          // current writer uses 16
+    if (flags.tilekey_present)
+        HYPC_RESERVED reserved;
+    else
+        u8 reserved[11];
+
+    float decode_min[3];      // scaled decode bounds
+    float decode_max[3];
+
+    // Derived decode steps
+    float step_x = (decode_max[0] - decode_min[0]) / 65535.0;
+    float step_y = (decode_max[1] - decode_min[1]) / 65535.0;
+    float step_z = (decode_max[2] - decode_min[2]) / 65535.0;
+
+    if (!(magic[0]=='H' && magic[1]=='P' && magic[2]=='C' && magic[3]=='1'))
+        std::error("Bad magic: expected 'HPC1'.");
+
+    if (quant_bits != 16)
+        std::warning(std::format("quant_bits = {} (writer uses 16).", quant_bits));
+};
+
+// ---------------------------------------------
+// Quantized payload point
+// ---------------------------------------------
+
+struct HYPC_POINT {
+    u16 qx;
+    u16 qy;
+    u16 qz;
+
+    // Decoded (derived)
+    float x = parent.hdr.decode_min[0] + float(qx) * parent.hdr.step_x;
+    float y = parent.hdr.decode_min[1] + float(qy) * parent.hdr.step_y;
+    float z = parent.hdr.decode_min[2] + float(qz) * parent.hdr.step_z;
+};
+
+// ---------------------------------------------
+// Optional SMC1 chunk (semantic mask)
+// ---------------------------------------------
+
+enum SMC1Encoding : u8 { RAW = 0, ZLIB = 1 };
+
+struct SMC1_CLASS_ENTRY {
+    u8  class_id;
+    u8  precedence;
+    u16 reserved;
+};
+
+struct SMC1_BUF {
+    u8  version;        // 1
+    u8  encoding;       // 0 = RAW, 1 = ZLIB
+    u16 width;
+    u16 height;
+    u8  coord_space;    // 0 => decode XY space
+    u8  class_count;
+    u16 reserved;
+
+    SMC1_CLASS_ENTRY classes[class_count];
+
+    u32 data_len;
+    u8  data[data_len];
+};
+
+struct SMC1_CHUNK {
+    char tag[4];        // "SMC1"
+    u32  length;        // length of SMC1_BUF (not including tag+length)
+    u64  _target = $ + length;
+
+    SMC1_BUF buf;
+
+    if (!(tag[0]=='S' && tag[1]=='M' && tag[2]=='C' && tag[3]=='1'))
+        std::error("SMC1 chunk tag mismatch.");
+
+    if ($ != _target) {
+        std::warning(std::format("SMC1 length mismatch: declared {}, parsed {}",
+                                 length, ($ - (_target - length))));
+        if ($ < _target) u8 _pad[_target - $];
+    }
+} [[static]];
+
+// ---------------------------------------------
+// Optional GEOT footer (CRS:84, deg Q7)
+// ---------------------------------------------
+
+struct GEOT_BODY {
+    u8  version;      // 1
+    u8  crs_id;       // 1 => CRS:84 (lon/lat degrees)
+    u8  mode;         // 0 => BBOX_DEG_Q7
+    u8  reserved;
+    s32 lon_min_q7;   // degrees * 1e7
+    s32 lat_min_q7;   // degrees * 1e7
+    u32 dlon_q7;      // width  in deg * 1e7
+    u32 dlat_q7;      // height in deg * 1e7
+
+    // Derived doubles in degrees
+    double lon_min = double(lon_min_q7) / 1.0e7;
+    double lat_min = double(lat_min_q7) / 1.0e7;
+    double lon_max = lon_min + double(dlon_q7) / 1.0e7;
+    double lat_max = lat_min + double(dlat_q7) / 1.0e7;
+};
+
+struct GEOT_CHUNK {
+    char tag[4];      // "GEOT"
+    GEOT_BODY body;
+
+    if (!(tag[0]=='G' && tag[1]=='E' && tag[2]=='O' && tag[3]=='T'))
+        std::error("GEOT footer tag mismatch.");
+} [[static]];
+
+// ---------------------------------------------
+// Tail dispatcher: zero or more SMC1s and/or one GEOT
+// ---------------------------------------------
+
+struct HYPC_TAIL_CHUNK {
+    // Peek tag by reading it; dispatch on value
+    char tag[4];
+
+    if (tag[0]=='S' && tag[1]=='M' && tag[2]=='C' && tag[3]=='1') {
+        // Re-parse chunk from the tag position to keep layout consistent
+        SMC1_CHUNK smc1 @ (addressof(tag));
+    }
+    else if (tag[0]=='G' && tag[1]=='E' && tag[2]=='O' && tag[3]=='T') {
+        GEOT_CHUNK geot @ (addressof(tag));
+    }
+    else {
+        std::warning(std::format("Unknown trailer tag '{}' '{}' '{}' '{}'",
+                                 tag[0], tag[1], tag[2], tag[3]));
+        u8 rest[std::mem::size() - addressof(this)];
+    }
+};
+
+// ---------------------------------------------
+// Top-level file
+// ---------------------------------------------
+
+struct HYPC_FILE {
+    HYPC_HEADER hdr;
+
+    // Safely bound the points by remaining bytes at this position
+    u64 payload_bytes = std::mem::size() - $;
+    u64 max_points    = payload_bytes / 6;  // 6 bytes per point (qx,qy,qz)
+    u64 n_points      = u64_min(hdr.count, max_points);
+
+    HYPC_POINT points[n_points];
+
+    if (n_points != hdr.count) {
+        std::warning(std::format(
+            "Truncated payload: header.count = {}, bytes allow {} points ({} bytes remaining).",
+            hdr.count, n_points, payload_bytes));
+    }
+
+    // Optional tail: zero or more chunks until EOF
+    HYPC_TAIL_CHUNK tail[while($ < std::mem::size())];
+};
+
+HYPC_FILE hypc @ 0x00;
+
