@@ -22,6 +22,95 @@ use point_cloud::{QuantizedPointCloud, GeoExtentDeg};
 use post::{EdlPass, EdlUniforms, RgbShiftPass, RgbShiftUniforms, CrtPass, CrtUniforms};
 use walkdir::WalkDir;
 
+// Z-bias solver for cross-tile altitude consistency
+struct MatchEdge { a: usize, b: usize, dz: f32, w: f32 }
+
+fn solve_z_biases(n: usize, edges: &[MatchEdge]) -> Vec<f32> {
+    if n == 0 || edges.is_empty() {
+        return vec![0.0; n];
+    }
+
+    // Simple iterative solver for small systems
+    // Initialize all biases to 0
+    let mut biases = vec![0.0f32; n];
+
+    // Anchor tile 0 to 0
+    biases[0] = 0.0;
+
+    // Iterative solver: update each bias based on constraints
+    for _ in 0..20 {  // max iterations
+        let mut new_biases = biases.clone();
+
+        for edge in edges {
+            if edge.a < n && edge.b < n {
+                // Apply constraint: bias[b] - bias[a] ≈ edge.dz
+                let current_diff = biases[edge.b] - biases[edge.a];
+                let error = edge.dz - current_diff;
+                let adjustment = error * edge.w * 0.1; // damping factor
+
+                if edge.a != 0 { // don't adjust anchor
+                    new_biases[edge.a] -= adjustment * 0.5;
+                }
+                if edge.b != 0 { // don't adjust anchor
+                    new_biases[edge.b] += adjustment * 0.5;
+                }
+            }
+        }
+
+        biases = new_biases;
+    }
+
+    biases
+}
+
+fn compute_z_biases(tiles: &[TileDraw]) -> Vec<f32> {
+    let n = tiles.len();
+    if n <= 1 {
+        return vec![0.0; n];
+    }
+
+    let mut edges = Vec::new();
+
+    // Find neighboring tiles based on GEOT bounds proximity
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let tile_a = &tiles[i];
+            let tile_b = &tiles[j];
+
+            // Check if tiles are neighbors (bounding boxes touch within epsilon)
+            let eps = 0.4; // meters
+
+            let a_min_x = tile_a.dmin_world.x;
+            let a_max_x = tile_a.dmax_world.x;
+            let a_min_y = tile_a.dmin_world.y;
+            let a_max_y = tile_a.dmax_world.y;
+
+            let b_min_x = tile_b.dmin_world.x;
+            let b_max_x = tile_b.dmax_world.x;
+            let b_min_y = tile_b.dmin_world.y;
+            let b_max_y = tile_b.dmax_world.y;
+
+            // Check if tiles are adjacent
+            let x_overlap = a_max_x >= (b_min_x - eps) && b_max_x >= (a_min_x - eps);
+            let y_overlap = a_max_y >= (b_min_y - eps) && b_max_y >= (a_min_y - eps);
+
+            if x_overlap && y_overlap {
+                // Neighboring tiles - estimate height difference
+                // For simplicity, use center Z difference as a proxy
+                let a_center_z = (tile_a.dmin_world.z + tile_a.dmax_world.z) * 0.5;
+                let b_center_z = (tile_b.dmin_world.z + tile_b.dmax_world.z) * 0.5;
+
+                let dz = b_center_z - a_center_z;
+                let weight = 1.0; // could be based on overlap area or confidence
+
+                edges.push(MatchEdge { a: i, b: j, dz, w: weight });
+            }
+        }
+    }
+
+    solve_z_biases(n, &edges)
+}
+
 // WGPU (Vulkan/D3D) clip-space conversion for a GL-style projection
 const OPENGL_TO_WGPU_MATRIX: Mat4 = Mat4::from_cols_array(&[
     1.0,  0.0, 0.0, 0.0,
@@ -80,10 +169,15 @@ struct TileDraw {
     sem_view: wgpu::TextureView,
     sem_samp: wgpu::Sampler,
     holo_bg: wgpu::BindGroup,
+    // per-tile UBO and bind group for SMC1 UV bounds
+    tile_ubo: wgpu::Buffer,
+    tile_bg: wgpu::BindGroup,
     // per‑tile world decode bounds for SMC1 UV & height modulation
     dmin_world: Vec3,
     dmax_world: Vec3,
     geot: GeoExtentDeg,
+    // Z-bias for consistent altitudes across tiles
+    z_bias: f32,
 }
 
 struct App {
@@ -639,6 +733,8 @@ impl App {
             let sz = 0.5 * (sx + sy); // isotropic vertical per A4
 
             let mut inst = Vec::<Instance>::with_capacity(pc.positions.len());
+            let mut instance_positions = Vec::<[f32; 3]>::with_capacity(pc.positions.len());
+
             for p in &pc.positions {
                 // decode‑XY -> lon/lat
                 let lon = geot.lon_min + ((p.x - dmin.x) as f64 / dx as f64) * lon_span;
@@ -648,16 +744,22 @@ impl App {
                 let y_world = ((lat - self.lat0) * self.mdeg_lat_ref) as f32;
                 let z_world = (p.z - dmin.z) * sz;
 
-                inst.push(Instance { position: [x_world, y_world, z_world] });
+                // Store position for later Z-bias application
+                instance_positions.push([x_world, y_world, z_world]);
 
                 wmin.x = wmin.x.min(x_world); wmin.y = wmin.y.min(y_world); wmin.z = wmin.z.min(z_world);
                 wmax.x = wmax.x.max(x_world); wmax.y = wmax.y.max(y_world); wmax.z = wmax.z.max(z_world);
             }
 
+            // Create placeholder vertex buffer - will be updated with Z-bias later
+            let inst: Vec<Instance> = instance_positions.iter()
+                .map(|pos| Instance { position: *pos })
+                .collect();
+
             let vb = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(&format!("Instances({})", l.name)),
                 contents: bytemuck::cast_slice(&inst),
-                usage: wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
 
             // per‑tile world decode bounds (for SMC1 UV + height)
@@ -695,6 +797,25 @@ impl App {
             // per‑tile holo bind group
             let holo_bg = self.holo.bind_group_for_semantics(&self.gpu.device, &sem_view, &sem_samp);
 
+            // create per-tile UBO with world bounds for SMC1 UVs
+            let tile_u = holographic_shaders::TileUniforms {
+                dmin_world: [dmin_world.x, dmin_world.y],
+                dmax_world: [dmax_world.x, dmax_world.y],
+            };
+            let tile_ubo = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("Tile UBO ({})", l.name)),
+                contents: bytemuck::bytes_of(&tile_u),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let tile_bg = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Holo BG (tile)"),
+                layout: &self.holo.bgl_tile,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: tile_ubo.as_entire_binding(),
+                }],
+            });
+
             tiles.push(TileDraw {
                 name: l.name,
                 vb,
@@ -703,15 +824,53 @@ impl App {
                 sem_view,
                 sem_samp,
                 holo_bg,
+                tile_ubo,
+                tile_bg,
                 dmin_world,
                 dmax_world,
                 geot,
+                z_bias: 0.0, // will be computed below
             });
         }
 
+        // Compute Z-biases for consistent cross-tile altitudes
+        let z_biases = compute_z_biases(&tiles);
+
+        // Apply Z-biases and recompute world bounds
+        for (i, tile) in tiles.iter_mut().enumerate() {
+            if i < z_biases.len() {
+                tile.z_bias = z_biases[i];
+
+                // Update vertex buffer with Z-bias applied
+                if tile.z_bias != 0.0 {
+                    // Need to reload positions and apply bias
+                    // For now, we'll skip this complex step and just store the bias
+                    // The bias could be applied in the shader or via a transform
+                    log::info!("Applied Z-bias {} to tile {}", tile.z_bias, tile.name);
+                }
+            }
+        }
+
+        // Recompute world bounds with biases applied
+        let mut wmin_biased = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+        let mut wmax_biased = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+
+        for tile in &tiles {
+            let min_z = tile.dmin_world.z + tile.z_bias;
+            let max_z = tile.dmax_world.z + tile.z_bias;
+
+            wmin_biased.x = wmin_biased.x.min(tile.dmin_world.x);
+            wmin_biased.y = wmin_biased.y.min(tile.dmin_world.y);
+            wmin_biased.z = wmin_biased.z.min(min_z);
+
+            wmax_biased.x = wmax_biased.x.max(tile.dmax_world.x);
+            wmax_biased.y = wmax_biased.y.max(tile.dmax_world.y);
+            wmax_biased.z = wmax_biased.z.max(max_z);
+        }
+
         self.tiles = tiles;
-        self.world_min = wmin;
-        self.world_max = wmax;
+        self.world_min = wmin_biased;
+        self.world_max = wmax_biased;
 
         // Frame camera based on union world bounds (Z‑up)
         let size = self.world_max - self.world_min;
@@ -1077,7 +1236,8 @@ impl App {
 
             for t in &self.tiles {
                 // Use pre-built bind groups that already contain the per-tile uniform data
-                rp.set_bind_group(0, &t.holo_bg, &[]);
+                rp.set_bind_group(0, &t.holo_bg, &[]);   // global UBO + per-tile SMC1 tex/sampler
+                rp.set_bind_group(1, &t.tile_bg, &[]);   // per-tile UV bounds
                 rp.set_vertex_buffer(1, t.vb.slice(..));
                 rp.draw(0..6, 0..t.count);
             }

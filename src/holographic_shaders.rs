@@ -47,6 +47,14 @@ pub struct HoloPipelines {
     pub quad_vb: wgpu::Buffer,
     pub uniforms: HoloUniforms,
     pub bgl: wgpu::BindGroupLayout,
+    pub bgl_tile: wgpu::BindGroupLayout,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TileUniforms {
+    pub dmin_world: [f32; 2],
+    pub dmax_world: [f32; 2],
 }
 
 #[repr(C)]
@@ -140,6 +148,23 @@ impl HoloPipelines {
             ],
         });
 
+        // per-tile layout for tile-specific SMC1 UV bounds
+        let bgl_tile = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Holo BGL (tile)"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
         // ---------- Dummy texture (1×1 R8Unorm) ----------
         let sem_dummy = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("SMC1 Dummy"),
@@ -212,7 +237,7 @@ impl HoloPipelines {
         // ---------- Pipeline layout ----------
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Holo PL"),
-            bind_group_layouts: &[&bgl],
+            bind_group_layouts: &[&bgl, &bgl_tile],  // add group(1)
             push_constant_ranges: &[],
         });
 
@@ -287,6 +312,7 @@ impl HoloPipelines {
             quad_vb,
             uniforms,
             bgl,
+            bgl_tile,
         }
     }
 
@@ -317,7 +343,7 @@ impl HoloPipelines {
         });
     }
 
-    /// NEW: build a per‑tile bind group (UBO shared, semantics specific).
+    /// build a per‑tile bind group (UBO shared, semantics specific).
     pub fn bind_group_for_semantics(&self, device: &wgpu::Device, sem_view: &wgpu::TextureView, sem_sampler: &wgpu::Sampler) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Holo BG (tile)"),
@@ -350,6 +376,13 @@ struct UBO {
 // --- SMC1 bindings ---
 @group(0) @binding(1) var tSMC1: texture_2d<f32>;   // R8Unorm labels → [0,1]
 @group(0) @binding(2) var sSMC1: sampler;           // nearest, clamp
+
+// per-tile uniform block for SMC1 UVs
+struct TileUBO {
+    dmin_world: vec2<f32>,   // tile decode XY mapped to world meters (min)
+    dmax_world: vec2<f32>,   // tile decode XY mapped to world meters (max)
+};
+@group(1) @binding(0) var<uniform> T: TileUBO;
 
 struct VSIn { @location(0) corner: vec2<f32>, @location(1) center: vec3<f32> };
 struct VSOut {
@@ -415,8 +448,8 @@ fn vs_main(in: VSIn) -> VSOut {
     let hfac = clamp((world.z - U.decode_min.z) / hr, 0.0, 1.0);
 
     // --- decode-XY → [0,1]^2 UV for SMC1 ---
-    let span = max(vec2<f32>(1e-6, 1e-6), (U.decode_max.xy - U.decode_min.xy));
-    let uv_sem = clamp((world.xy - U.decode_min.xy) / span, vec2<f32>(0.0), vec2<f32>(1.0));
+    let span = max(vec2<f32>(1e-6, 1e-6), (T.dmax_world - T.dmin_world));
+    let uv_sem = clamp((world.xy - T.dmin_world) / span, vec2<f32>(0.0), vec2<f32>(1.0));
 
     var out: VSOut;
     out.clip = clip;
@@ -432,7 +465,7 @@ fn hash(p: vec2<f32>) -> f32 {
     return fract(sin(dot(p, vec2<f32>(12.9898,78.233))) * 43758.5453);
 }
 
-// --- NEW: fixed palette (10 classes) ---
+// --- fixed palette (10 classes) ---
 // 0:Unknown 1:Building 2:RoadMajor 3:RoadMinor 4:Path 5:Water 6:Park 7:Woodland 8:Railway 9:Parking
 const PAL: array<vec3<f32>, 10> = array<vec3<f32>, 10>(
     vec3<f32>(0.12, 0.12, 0.12), // Unknown
