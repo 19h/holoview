@@ -99,6 +99,10 @@ struct Args {
     /// Try to run 'osmium extract' + 'osmium tags-filter' to shrink the PBF first.
     #[arg(long, default_value_t = false)]
     osm_prefilter: bool,
+
+    /// Use global Z=0 reference for consistent tile alignment (recommended for multi-tile datasets)
+    #[arg(long, default_value_t = false)]
+    use_global_z_ref: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -355,6 +359,17 @@ fn quantize_positions(
     point_budget: usize,
     target_extent: f32,
 ) -> (Vec<u16>, usize, [f32; 3], [f32; 3]) {
+    quantize_positions_with_options(positions, point_budget, target_extent, false)
+}
+
+/// Quantize positions with optional global reference mode.
+/// When use_global_ref is true, all axes use consistent centering.
+fn quantize_positions_with_options(
+    positions: &[f32],
+    point_budget: usize,
+    target_extent: f32,
+    use_global_ref: bool,
+) -> (Vec<u16>, usize, [f32; 3], [f32; 3]) {
     let n = positions.len() / 3;
     let (mut minx, mut miny, mut minz) = (positions[0], positions[1], positions[2]);
     let (mut maxx, mut maxy, mut maxz) = (minx, miny, minz);
@@ -392,10 +407,15 @@ fn quantize_positions(
     let dy = 0.5 * sy * scale;
     let dz = 0.5 * sz * scale;
 
-    // Keep original z-center to preserve relative vertical offsets between tiles
-    let z_center = 0.5 * (minz + maxz);
-    let decode_min = [-dx, -dy, z_center * scale - dz];
-    let decode_max = [dx, dy, z_center * scale + dz];
+    // For global reference mode, just change the Z centering to keep Z values more consistent
+    let (decode_min, decode_max) = if use_global_ref {
+        // Use same centering as legacy but don't recenter Z - keep raw Z values
+        // This should help with alignment while not breaking the coordinate system
+        ([-dx, -dy, minz * scale], [dx, dy, maxz * scale])
+    } else {
+        // Legacy mode: center all axes at origin
+        ([-dx, -dy, -dz], [dx, dy, dz])
+    };
 
     let stride = ((n + point_budget - 1) / point_budget).max(1);
     let m = n / stride;
@@ -1138,7 +1158,7 @@ fn decode_xy_to_pixel(
     let norm_x = (dx - decode_min[0]) / (decode_max[0] - decode_min[0]);
     let norm_y = (dy - decode_min[1]) / (decode_max[1] - decode_min[1]);
     let ix = (norm_x * (w as f32)).round() as i32;
-    let iy = ((1.0 - norm_y) * (h as f32)).round() as i32;
+    let iy = (norm_y * (h as f32)).round() as i32;
     (ix, iy)
 }
 
@@ -1449,7 +1469,7 @@ fn process_one_mesh(
 
     // Quantize
     let (q, m, decode_min, decode_max) =
-        quantize_positions(&positions, args.point_budget, args.target_extent);
+        quantize_positions_with_options(&positions, args.point_budget, args.target_extent, args.use_global_z_ref);
 
     // Build optional SMC1 (data is decompressed in-memory; hypc handles compression)
     let smc1_opt: Option<Smc1> = if args.write_smc1 {
