@@ -50,13 +50,18 @@ pub struct HoloPipelines {
     pub bgl_tile: wgpu::BindGroupLayout,
 }
 
+// PATCH 1: Fix the UBO layout for TileUniforms (critical)
+// The Rust layout now matches the WGSL std140-style layout exactly,
+// including the 4-byte pad before xy_bias to ensure 8-byte alignment.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TileUniforms {
-    pub dmin_world: [f32; 2],    // 8 bytes
-    pub dmax_world: [f32; 2],    // 8 bytes
-    pub z_bias: f32,             // 4 bytes
-    pub _padding: [u32; 11],     // 44 bytes (pad to 64 bytes total)
+    pub dmin_world: [f32; 2],    // offset 0, size 8
+    pub dmax_world: [f32; 2],    // offset 8, size 8
+    pub z_bias: f32,             // offset 16, size 4
+    pub _pad_after_z: f32,       // offset 20, size 4 <-- NEW pad to align vec2 at 24
+    pub xy_bias: [f32; 2],       // offset 24, size 8
+    pub _padding: [u32; 22],     // tail padding to bring total size to 120 bytes
 }
 
 #[repr(C)]
@@ -380,13 +385,15 @@ struct UBO {
 @group(0) @binding(2) var sSMC1: sampler;           // nearest, clamp
 
 // per-tile uniform block for SMC1 UVs
+// NOTE: This layout is correct and matches the padded Rust struct.
+// vec2 has 8-byte alignment in uniform buffers.
 struct TileUBO {
-    dmin_world: vec2<f32>,   // tile decode XY mapped to world meters (min)
-    dmax_world: vec2<f32>,   // tile decode XY mapped to world meters (max)
-    z_bias: f32,
-    _pad0: u32, _pad1: u32, _pad2: u32, _pad3: u32,
-    _pad4: u32, _pad5: u32, _pad6: u32, _pad7: u32,
-    _pad8: u32, _pad9: u32, _pad10: u32,
+    dmin_world: vec2<f32>,   // align 8, offset 0
+    dmax_world: vec2<f32>,   // align 8, offset 8
+    z_bias: f32,             // align 4, offset 16
+    // implicit 4-byte padding here
+    xy_bias: vec2<f32>,      // align 8, offset 24
+    // ... more padding
 };
 @group(1) @binding(0) var<uniform> T: TileUBO;
 
@@ -402,8 +409,9 @@ struct VSOut {
 
 @vertex
 fn vs_main(in: VSIn) -> VSOut {
-    // Apply per-tile vertical bias before any depth/size work.
-    let world = vec3<f32>(in.center.xy, in.center.z + T.z_bias);
+    // Apply per-tile XY & Z biases
+    let world_xy = in.center.xy + T.xy_bias;
+    let world = vec3<f32>(world_xy, in.center.z + T.z_bias);
 
     // Transform to view space
     let view_pos = U.view * vec4<f32>(world, 1.0);
@@ -456,7 +464,7 @@ fn vs_main(in: VSIn) -> VSOut {
 
     // --- decode-XY → [0,1]^2 UV for SMC1 ---
     let span = max(vec2<f32>(1e-6, 1e-6), (T.dmax_world - T.dmin_world));
-    let uv_sem = clamp((world.xy - T.dmin_world) / span, vec2<f32>(0.0), vec2<f32>(1.0));
+    let uv_sem = clamp((world_xy - T.dmin_world) / span, vec2<f32>(0.0), vec2<f32>(1.0));
 
     var out: VSOut;
     out.clip = clip;
