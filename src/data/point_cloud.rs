@@ -1,3 +1,6 @@
+// src/data/point_cloud.rs
+// NOTE: This file is identical to the original `point_cloud.rs`, with the addition of two public helper functions.
+
 use anyhow::Result;
 use glam::Vec3;
 use ply_rs::{parser, ply};
@@ -5,9 +8,19 @@ use std::{
     fs::File,
     io::{BufReader, Read, Seek, SeekFrom},
 };
-
-// === SMC1 additions ===
 use miniz_oxide::inflate::decompress_to_vec_zlib;
+
+// Two new public helper functions moved from main.rs
+pub fn meters_per_deg_lat(lat_deg: f64) -> f64 {
+    let phi = lat_deg.to_radians();
+    111_132.92 - 559.82 * (2.0 * phi).cos() + 1.175 * (4.0 * phi).cos() - 0.0023 * (6.0 * phi).cos()
+}
+
+pub fn meters_per_deg_lon(lat_deg: f64) -> f64 {
+    let phi = lat_deg.to_radians();
+    111_412.84 * phi.cos() - 93.5 * (3.0 * phi).cos() + 0.118 * (5.0 * phi).cos()
+}
+
 
 #[derive(Debug, Clone)]
 pub enum TileKey {
@@ -28,7 +41,6 @@ pub struct GeoExtentDeg {
     pub lat_max: f64,
 }
 
-// === SMC1 additions ===
 #[derive(Debug, Clone)]
 pub struct SemanticMask {
     pub width: u16,
@@ -48,8 +60,6 @@ pub struct QuantizedPointCloud {
     pub tile_key: Option<TileKey>,
     pub geog_crs: Option<GeoCrs>,
     pub geog_bbox_deg: Option<GeoExtentDeg>,
-
-    // === SMC1 additions ===
     pub semantic_mask: Option<SemanticMask>,
 }
 
@@ -93,7 +103,6 @@ fn parse_tilekey(flags: u32, reserved: &[u8; 11]) -> Option<TileKey> {
     }
 }
 
-// === SMC1 parsing (versioned, with palette & precedence)
 fn parse_smc1<R: Read>(r: &mut R) -> Result<SemanticMask> {
     let payload_len = read_u32(r)? as usize; // total payload bytes
     let mut buf = vec![0u8; payload_len];

@@ -1,4 +1,6 @@
-// src/holographic_shaders.rs
+// src/renderer/pipelines/hologram.rs
+// NOTE: Renamed HoloPipelines -> HologramPipeline for consistency. Otherwise identical.
+
 use wgpu::util::DeviceExt;
 use glam::{Mat4, Vec3};
 
@@ -7,9 +9,9 @@ use glam::{Mat4, Vec3};
 pub struct HoloUniforms {
     pub view: Mat4,
     pub proj: Mat4,
-    pub viewport: [f32; 2],   // (width, height)
-    pub base_size_px: f32,    // ~1.0
-    pub size_atten: f32,      // ~1.25
+    pub viewport: [f32; 2],
+    pub base_size_px: f32,
+    pub size_atten: f32,
     pub time: f32,
     pub near: f32,
     pub far: f32,
@@ -22,25 +24,18 @@ pub struct HoloUniforms {
 impl Default for HoloUniforms {
     fn default() -> Self {
         Self {
-            view: Mat4::IDENTITY,
-            proj: Mat4::IDENTITY,
-            viewport: [1280.0, 720.0],
-            base_size_px: 4.0,
-            size_atten: 1.0,
-            time: 0.0,
-            near: 0.5,
-            far: 8000.0,
-            _pad: 0.0,
-            decode_min: Vec3::ZERO,
-            decode_max: Vec3::ONE,
-            cyan: Vec3::new(1.1, 0.5, 0.2),     // uniform warm orange
-            red:  Vec3::new(0.5, 0.5, 0.2),      // very similar warm orange
+            view: Mat4::IDENTITY, proj: Mat4::IDENTITY,
+            viewport: [1280.0, 720.0], base_size_px: 4.0, size_atten: 1.0,
+            time: 0.0, near: 0.5, far: 8000.0, _pad: 0.0,
+            decode_min: Vec3::ZERO, decode_max: Vec3::ONE,
+            cyan: Vec3::new(1.1, 0.5, 0.2),
+            red:  Vec3::new(0.5, 0.5, 0.2),
             _pad0: 0.0, _pad1: 0.0, _pad2: 0.0, _pad3: 0.0,
         }
     }
 }
 
-pub struct HoloPipelines {
+pub struct HologramPipeline {
     pub pipeline: wgpu::RenderPipeline,
     pub bind_group: wgpu::BindGroup,
     pub uniform_buffer: wgpu::Buffer,
@@ -50,18 +45,15 @@ pub struct HoloPipelines {
     pub bgl_tile: wgpu::BindGroupLayout,
 }
 
-// PATCH 1: Fix the UBO layout for TileUniforms (critical)
-// The Rust layout now matches the WGSL std140-style layout exactly,
-// including the 4-byte pad before xy_bias to ensure 8-byte alignment.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TileUniforms {
-    pub dmin_world: [f32; 2],    // offset 0, size 8
-    pub dmax_world: [f32; 2],    // offset 8, size 8
-    pub z_bias: f32,             // offset 16, size 4
-    pub _pad_after_z: f32,       // offset 20, size 4 <-- NEW pad to align vec2 at 24
-    pub xy_bias: [f32; 2],       // offset 24, size 8
-    pub _padding: [u32; 22],     // tail padding to bring total size to 120 bytes
+    pub dmin_world: [f32; 2],
+    pub dmax_world: [f32; 2],
+    pub z_bias: f32,
+    pub _pad_after_z: f32,
+    pub xy_bias: [f32; 2],
+    pub _padding: [u32; 22],
 }
 
 #[repr(C)]
@@ -87,7 +79,6 @@ impl Instance {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct QuadVertex {
-    // Local corners in [-1, 1]^2
     corner: [f32; 2],
 }
 
@@ -105,13 +96,12 @@ impl QuadVertex {
     }
 }
 
-impl HoloPipelines {
+impl HologramPipeline {
     pub fn new(
         device: &wgpu::Device,
         scene_format: wgpu::TextureFormat,
         depthlin_format: wgpu::TextureFormat,
     ) -> Self {
-        // ---------- Uniform buffer ----------
         let uniforms = HoloUniforms::default();
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Holo Uniforms"),
@@ -119,115 +109,61 @@ impl HoloPipelines {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // ---------- Bind group layout ----------
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Holo BGL"),
             entries: &[
-                // Uniform buffer object
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
+                    binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
-                // SMC1 label texture (R8Unorm → Float sample type)
                 wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    binding: 1, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false, view_dimension: wgpu::TextureViewDimension::D2,
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
                     count: None,
                 },
-                // Nearest sampler for labels
                 wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    binding: 2, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
             ],
         });
 
-        // per-tile layout for tile-specific SMC1 UV bounds
         let bgl_tile = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Holo BGL (tile)"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
+                    binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
                 },
             ],
         });
 
-        // ---------- Dummy texture (1×1 R8Unorm) ----------
         let sem_dummy = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("SMC1 Dummy"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
+            label: Some("SMC1 Dummy"), size: wgpu::Extent3d::default(), mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
         });
         let sem_dummy_view = sem_dummy.create_view(&wgpu::TextureViewDescriptor::default());
+        let sem_sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("SMC1 Nearest"), ..Default::default() });
 
-        let sem_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("SMC1 Nearest"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            ..Default::default()
-        });
-
-        // ---------- Bind group ----------
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Holo BG"),
-            layout: &bgl,
+            label: Some("Holo BG"), layout: &bgl,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&sem_dummy_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sem_sampler),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sem_dummy_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sem_sampler) },
             ],
         });
 
-        // ---------- Instanced quad geometry ----------
         let corners = [
-            QuadVertex { corner: [-1.0, -1.0] },
-            QuadVertex { corner: [ 1.0, -1.0] },
-            QuadVertex { corner: [ 1.0,  1.0] },
-            QuadVertex { corner: [-1.0, -1.0] },
-            QuadVertex { corner: [ 1.0,  1.0] },
-            QuadVertex { corner: [-1.0,  1.0] },
+            QuadVertex { corner: [-1.0, -1.0] }, QuadVertex { corner: [ 1.0, -1.0] }, QuadVertex { corner: [ 1.0,  1.0] },
+            QuadVertex { corner: [-1.0, -1.0] }, QuadVertex { corner: [ 1.0,  1.0] }, QuadVertex { corner: [-1.0,  1.0] },
         ];
         let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Point Quad VB"),
@@ -235,51 +171,36 @@ impl HoloPipelines {
             usage: wgpu::BufferUsages::VERTEX,
         });
 
-        // ---------- Shader ----------
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Holo WGSL"),
             source: wgpu::ShaderSource::Wgsl(HOLO_WGSL.into()),
         });
 
-        // ---------- Pipeline layout ----------
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Holo PL"),
-            bind_group_layouts: &[&bgl, &bgl_tile],  // add group(1)
+            bind_group_layouts: &[&bgl, &bgl_tile],
             push_constant_ranges: &[],
         });
 
-        // ---------- Render pipeline ----------
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Holo Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
+                module: &shader, entry_point: "vs_main",
                 buffers: &[QuadVertex::layout(), Instance::layout()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
+                module: &shader, entry_point: "fs_main",
                 targets: &[
-                    // Color target
                     Some(wgpu::ColorTargetState {
                         format: scene_format,
                         blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::SrcAlpha,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
+                            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+                            alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
                         }),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
-                    // Linearized depth buffer (RGBA16F)
                     Some(wgpu::ColorTargetState {
                         format: depthlin_format,
                         blend: Some(wgpu::BlendState::REPLACE),
@@ -288,15 +209,7 @@ impl HoloPipelines {
                 ],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: true,
@@ -305,52 +218,16 @@ impl HoloPipelines {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: 4, // Must match SAMPLE_COUNT in main.rs
+                count: 4, // Must match SAMPLE_COUNT in renderer/targets.rs
                 mask: !0,
-                alpha_to_coverage_enabled: false, // Can be enabled for better sprite edges
+                alpha_to_coverage_enabled: false,
             },
             multiview: None,
         });
 
-        Self {
-            pipeline,
-            bind_group,
-            uniform_buffer,
-            quad_vb,
-            uniforms,
-            bgl,
-            bgl_tile,
-        }
+        Self { pipeline, bind_group, uniform_buffer, quad_vb, uniforms, bgl, bgl_tile }
     }
 
-    pub fn set_semantics_inputs(
-        &mut self,
-        device: &wgpu::Device,
-        sem_view: &wgpu::TextureView,
-        sem_sampler: &wgpu::Sampler,
-    ) {
-        // Rebuild the bind group with the same UBO but new texture & sampler
-        self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Holo BG (with SMC1)"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(sem_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(sem_sampler),
-                },
-            ],
-        });
-    }
-
-    /// build a per‑tile bind group (UBO shared, semantics specific).
     pub fn bind_group_for_semantics(&self, device: &wgpu::Device, sem_view: &wgpu::TextureView, sem_sampler: &wgpu::Sampler) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Holo BG (tile)"),
@@ -368,6 +245,7 @@ impl HoloPipelines {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
     }
 }
+
 pub const HOLO_WGSL: &str = r#"
 struct UBO {
     view: mat4x4<f32>, proj: mat4x4<f32>,

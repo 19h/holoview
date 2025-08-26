@@ -1,4 +1,6 @@
-// src/ground_grid.rs
+// src/renderer/pipelines/ground_grid.rs
+// NOTE: Renamed GroundGrid -> GroundGridPipeline for consistency. Otherwise identical.
+
 use wgpu::util::DeviceExt;
 use glam::{Mat4, Vec3};
 
@@ -7,29 +9,35 @@ use glam::{Mat4, Vec3};
 pub struct GridUniforms {
     pub view: Mat4,
     pub proj: Mat4,
-
-    pub decode_min: Vec3,
-    pub _pad0: f32,
-    pub decode_max: Vec3,
-    pub _pad1: f32,
-
-    // GEOT (CRS:84) bbox
-    pub geot_lon_min: f32,
-    pub geot_lat_min: f32,
-    pub geot_lon_span: f32,
-    pub geot_lat_span: f32,
-
-    // rendering controls
-    pub extent_mul: f32,  // how much larger than the tile AABB to draw (e.g. 12.0)
-    pub z_offset:  f32,   // push plane a little below decode_min.z (in world units)
-    pub opacity:   f32,   // 0..1
-    pub enabled:   u32,   // 1 = on, 0 = off
-
+    pub decode_min: Vec3, pub _pad0: f32,
+    pub decode_max: Vec3, pub _pad1: f32,
+    pub geot_lon_min: f32, pub geot_lat_min: f32,
+    pub geot_lon_span: f32, pub geot_lat_span: f32,
+    pub extent_mul: f32,
+    pub z_offset:  f32,
+    pub opacity:   f32,
+    pub enabled:   u32,
     pub color_minor: Vec3, pub _pad2: f32,
     pub color_major: Vec3, pub _pad3: f32,
 }
 
-pub struct GroundGrid {
+impl Default for GridUniforms {
+    fn default() -> Self {
+        Self {
+            view: Mat4::IDENTITY, proj: Mat4::IDENTITY,
+            decode_min: Vec3::ZERO, _pad0: 0.0,
+            decode_max: Vec3::ONE,  _pad1: 0.0,
+            geot_lon_min: 0.0, geot_lat_min: 0.0,
+            geot_lon_span: 1.0, geot_lat_span: 1.0,
+            extent_mul: 12.0, z_offset: 0.02, opacity: 0.70, enabled: 0,
+            color_minor: Vec3::new(0.90, 0.15, 0.15), _pad2: 0.0,
+            color_major: Vec3::new(1.00, 0.20, 0.20), _pad3: 0.0,
+        }
+    }
+}
+
+
+pub struct GroundGridPipeline {
     pub pipeline: wgpu::RenderPipeline,
     pub bind_group: wgpu::BindGroup,
     pub uniform_buffer: wgpu::Buffer,
@@ -56,19 +64,9 @@ impl QuadVertex {
     }
 }
 
-impl GroundGrid {
+impl GroundGridPipeline {
     pub fn new(device: &wgpu::Device, scene_format: wgpu::TextureFormat, depthlin_format: wgpu::TextureFormat) -> Self {
-        let uniforms = GridUniforms {
-            view: Mat4::IDENTITY,
-            proj: Mat4::IDENTITY,
-            decode_min: Vec3::ZERO, _pad0: 0.0,
-            decode_max: Vec3::ONE,  _pad1: 0.0,
-            geot_lon_min: 0.0, geot_lat_min: 0.0,
-            geot_lon_span: 1.0, geot_lat_span: 1.0,
-            extent_mul: 12.0, z_offset: 0.02, opacity: 0.70, enabled: 0,
-            color_minor: Vec3::new(0.90, 0.15, 0.15), _pad2: 0.0,
-            color_major: Vec3::new(1.00, 0.20, 0.20), _pad3: 0.0,
-        };
+        let uniforms = GridUniforms::default();
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Grid Uniforms"),
             contents: bytemuck::bytes_of(&uniforms),
@@ -98,7 +96,6 @@ impl GroundGrid {
             }],
         });
 
-        // big quad (two triangles) in local [-1,1]^2, expanded in VS by extent_mul
         let corners: [QuadVertex; 6] = [
             QuadVertex { corner: [-1.0, -1.0] }, QuadVertex { corner: [ 1.0, -1.0] }, QuadVertex { corner: [ 1.0,  1.0] },
             QuadVertex { corner: [-1.0, -1.0] }, QuadVertex { corner: [ 1.0,  1.0] }, QuadVertex { corner: [-1.0,  1.0] },
@@ -133,13 +130,11 @@ impl GroundGrid {
                 module: &shader,
                 entry_point: "fs_main",
                 targets: &[
-                    // scene color
                     Some(wgpu::ColorTargetState {
                         format: scene_format,
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
-                    // linear depth buffer
                     Some(wgpu::ColorTargetState {
                         format: depthlin_format,
                         blend: Some(wgpu::BlendState::REPLACE),
@@ -150,22 +145,18 @@ impl GroundGrid {
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
+                ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,               // << do NOT write depth (points will)
+                depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: 4, // Must match SAMPLE_COUNT in main.rs
+                count: 4, // Must match SAMPLE_COUNT in renderer/targets.rs
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -247,7 +238,7 @@ fn pick_steps_blended(goal: f32) -> vec3<f32> {
     // Find enclosing interval [s_lo, s_hi] using unrolled comparisons
     var s_lo = s0;
     var s_hi = s1;
-    
+
     if (g > s1) {
         s_lo = s1;
         s_hi = s2;
