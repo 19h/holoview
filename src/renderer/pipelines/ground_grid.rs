@@ -1,5 +1,4 @@
 // src/renderer/pipelines/ground_grid.rs
-// NOTE: Renamed GroundGrid -> GroundGridPipeline for consistency. Otherwise identical.
 
 use wgpu::util::DeviceExt;
 use glam::{Mat4, Vec3};

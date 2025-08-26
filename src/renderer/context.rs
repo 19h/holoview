@@ -60,7 +60,15 @@ impl GpuContext {
         };
         surface.configure(&device, &config);
 
-        Self { surface, device, queue, adapter, config, size, surface_format }
+        Self {
+            surface,
+            device,
+            queue,
+            adapter,
+            config,
+            size,
+            surface_format,
+        }
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {

@@ -4,17 +4,21 @@
 
 pub mod context;
 pub mod pipelines;
+pub mod semantics;
 pub mod targets;
 
 use self::{
     context::GpuContext,
     pipelines::{
-        ground_grid::GroundGridPipeline, hologram::HologramPipeline, postprocess::CrtPass,
-        postprocess::EdlPass, postprocess::PostPass, postprocess::RgbShiftPass,
+        base::PostPass,
+        ground_grid::GroundGridPipeline,
+        hologram::HologramPipeline,
+        postprocess::{CrtPass, EdlPass, RgbShiftPass},
     },
+    semantics::SemanticsIO,
     targets::RenderTargets,
 };
-use crate::data::point_cloud::{GeoExtentDeg, SemanticMask};
+use crate::data::{GeoExtentDeg, SemanticMask};
 use glam::{Vec2, Vec3};
 use std::sync::Arc;
 use winit::window::Window;
@@ -49,9 +53,8 @@ pub struct Renderer {
     pub targets: RenderTargets,
     pub pipelines: AllPipelines,
     pub egui_renderer: egui_wgpu::Renderer,
-    // Fallback resources for tiles without semantic masks
-    sem_fallback_tex: wgpu::Texture,
-    // CORRECTED: Removed sem_fallback_samp, as Sampler is not Clone.
+    // Semantic mask I/O handler
+    semantics_io: SemanticsIO,
 }
 
 /// A container for all the render pass pipelines.
@@ -92,26 +95,11 @@ impl Renderer {
             1,
         );
 
-        // Fallback SMC1 resources
-        let sem_fallback_tex = context.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("SMC1 Fallback 1x1"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        context.queue.write_texture(
-            wgpu::ImageCopyTexture { texture: &sem_fallback_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            &[0u8], // label=0 → Unknown
-            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(1), rows_per_image: Some(1) },
-            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-        );
-
-        // CORRECTED: Removed creation of sem_fallback_samp here.
+        // Initialize semantic mask I/O handler
+        let semantics_io = SemanticsIO::new(&context.device, &context.queue);
 
         let pipelines = AllPipelines { hologram, ground_grid, post_edl, post_rgb, post_crt };
-        Self { context, targets, pipelines, egui_renderer, sem_fallback_tex }
+        Self { context, targets, pipelines, egui_renderer, semantics_io }
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -189,49 +177,6 @@ impl Renderer {
         &self,
         sm: Option<&SemanticMask>,
     ) -> (Option<wgpu::Texture>, wgpu::TextureView, wgpu::Sampler) {
-        let Some(sm) = sm else {
-            let fallback_view = self.sem_fallback_tex.create_view(&wgpu::TextureViewDescriptor::default());
-            // CORRECTED: Create a new sampler here instead of cloning.
-            let fallback_sampler = self.context.device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("SMC1 Fallback Sampler (instance)"),
-                mag_filter: wgpu::FilterMode::Nearest,
-                min_filter: wgpu::FilterMode::Nearest,
-                ..Default::default()
-            });
-            return (None, fallback_view, fallback_sampler);
-        };
-
-        let (width, height) = (sm.width as u32, sm.height as u32);
-        let texture = self.context.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("SMC1 Labels"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        let bytes_per_row = ((width + 255) / 256) * 256;
-        let mut staging_data = vec![0u8; (bytes_per_row * height) as usize];
-        for row in 0..height as usize {
-            let source_row = &sm.data[row * width as usize..(row + 1) * width as usize];
-            let dest_row = &mut staging_data[row * bytes_per_row as usize..row * bytes_per_row as usize + width as usize];
-            dest_row.copy_from_slice(source_row);
-        }
-
-        self.context.queue.write_texture(
-            wgpu::ImageCopyTexture { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            &staging_data,
-            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(bytes_per_row), rows_per_image: Some(height) },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
-
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = self.context.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("SMC1 Nearest"), mag_filter: wgpu::FilterMode::Nearest, min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        (Some(texture), view, sampler)
+        self.semantics_io.upload_r8(&self.context.device, &self.context.queue, sm)
     }
 }

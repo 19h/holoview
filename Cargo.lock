@@ -979,6 +979,7 @@ dependencies = [
  "egui-winit",
  "env_logger",
  "glam",
+ "hypc",
  "linked-hash-map",
  "log",
  "miniz_oxide",
@@ -988,6 +989,14 @@ dependencies = [
  "walkdir",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "hypc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "miniz_oxide",
 ]
 
 [[package]]

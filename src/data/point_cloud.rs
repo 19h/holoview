@@ -10,65 +10,34 @@ use std::fs::File;
 use std::io::BufReader;
 
 use hypc::{self, GeoCrs as HypcGeoCrs, HypcPointCloud as HypcPC, SemanticMask as HypcSM};
+use crate::data::types::{TileKey, GeoCrs, GeoExtentDeg, SemanticMask};
 
 /// Returns the number of meters per degree of latitude at a given latitude.
+///
+/// Uses the WGS-84 ellipsoid approximation.
+///
+/// # Arguments
+/// * `lat_deg` - Latitude in degrees
+///
+/// # Returns
+/// Meters per degree of latitude at the given latitude.
 pub fn meters_per_deg_lat(lat_deg: f64) -> f64 {
     let phi = lat_deg.to_radians();
     111_132.92 - 559.82 * (2.0 * phi).cos() + 1.175 * (4.0 * phi).cos() - 0.0023 * (6.0 * phi).cos()
 }
 
 /// Returns the number of meters per degree of longitude at a given latitude.
+///
+/// Uses the WGS-84 ellipsoid approximation.
+///
+/// # Arguments
+/// * `lat_deg` - Latitude in degrees
+///
+/// # Returns
+/// Meters per degree of longitude at the given latitude.
 pub fn meters_per_deg_lon(lat_deg: f64) -> f64 {
     let phi = lat_deg.to_radians();
     111_412.84 * phi.cos() - 93.5 * (3.0 * phi).cos() + 0.118 * (5.0 * phi).cos()
-}
-
-/// Represents a tile key for point cloud data.
-#[derive(Debug, Clone)]
-pub enum TileKey {
-    /// A tile key based on x, y coordinates and zoom level.
-    XY { zoom: u8, x: u32, y: u32, scheme: u8 },
-    /// A tile key based on a 64-bit hash of a name.
-    NameHash64 { hash: u64 },
-}
-
-/// Represents a geographic coordinate reference system.
-#[derive(Debug, Clone)]
-pub enum GeoCrs {
-    /// WGS 84 / CRS84 - longitude/latitude in degrees.
-    Crs84,
-}
-
-/// Represents a geographic bounding box in degrees.
-#[derive(Debug, Clone)]
-pub struct GeoExtentDeg {
-    /// Minimum longitude in degrees.
-    pub lon_min: f64,
-    /// Minimum latitude in degrees.
-    pub lat_min: f64,
-    /// Maximum longitude in degrees.
-    pub lon_max: f64,
-    /// Maximum latitude in degrees.
-    pub lat_max: f64,
-}
-
-/// Represents a semantic mask for point cloud data.
-#[derive(Debug, Clone)]
-pub struct SemanticMask {
-    /// Width of the semantic mask in pixels.
-    pub width: u16,
-    /// Height of the semantic mask in pixels.
-    pub height: u16,
-    /// Decompressed label data in row-major order.
-    pub data: Vec<u8>,
-    /// Label palette mapping class IDs to precedence values.
-    pub palette: Vec<(u8 /* class */, u8 /* precedence */ )>,
-    /// Coordinate space of the semantic mask.
-    /// 0 = decode XY space.
-    pub coord_space: u8,
-    /// Encoding format of the semantic mask data.
-    /// 0 = raw, 1 = zlib compressed.
-    pub encoding: u8,
 }
 
 /// A point cloud with quantized positions and optional geographic and semantic metadata.

@@ -1,11 +1,12 @@
 // src/app.rs
 use crate::{
     camera::{Camera, CameraController},
-    data::{point_cloud, tile_aligner}, // Corrected: Import point_cloud
+    data::{point_cloud, tile_aligner},
     renderer::{
         pipelines::{
-            ground_grid::GridUniforms, hologram::HoloUniforms, postprocess::CrtUniforms,
-            postprocess::EdlUniforms, postprocess::RgbShiftUniforms,
+            ground_grid::GridUniforms,
+            hologram::HoloUniforms,
+            postprocess::{CrtUniforms, EdlUniforms, RgbShiftUniforms},
         },
         Renderer, TileDraw,
     },
@@ -17,17 +18,17 @@ use std::{sync::Arc, time::Instant};
 use walkdir::WalkDir;
 use wgpu::util::DeviceExt;
 use winit::{
-    event::{ElementState, WindowEvent}, // Corrected: Removed unused MouseButton
+    event::{ElementState, WindowEvent},
     keyboard::{KeyCode, PhysicalKey},
     window::Window,
 };
 
-// WGPU (Vulkan/D3D) clip-space conversion for a GL-style projection
+/// WGPU (Vulkan/D3D) clip-space conversion for a GL-style projection
 const OPENGL_TO_WGPU_MATRIX: Mat4 = Mat4::from_cols_array(&[
-    1.0, 0.0, 0.0, 0.0,
-    0.0, -1.0, 0.0, 0.0, // flip Y
-    0.0, 0.0, 0.5, 0.0, // map z: [-1,1] -> [0,1]
-    0.0, 0.0, 0.5, 1.0,
+    1.0,  0.0,  0.0, 0.0,
+    0.0, -1.0,  0.0, 0.0, // flip Y
+    0.0,  0.0,  0.5, 0.0, // map z: [-1,1] -> [0,1]
+    0.0,  0.0,  0.5, 1.0,
 ]);
 
 pub struct App {
@@ -42,7 +43,7 @@ pub struct App {
     tiles: Vec<TileDraw>,
     world_min: Vec3,
     world_max: Vec3,
-    geot_union: Option<point_cloud::GeoExtentDeg>, // Corrected: Path is now valid
+    geot_union: Option<crate::data::GeoExtentDeg>,
     lon0: f64,
     lat0: f64,
     mdeg_lon_ref: f64,
@@ -115,13 +116,16 @@ impl App {
     }
 
     pub fn handle_event(&mut self, event: &WindowEvent) -> bool {
+        // Give egui first dibs on the event
         let response = self.egui_state.on_window_event(&self.window, event);
         if response.consumed {
             return true;
         }
 
+        // Handle camera controls
         self.camera_controller.handle_event(event, &mut self.camera);
 
+        // Handle other window events
         match event {
             WindowEvent::Resized(size) => self.resize(*size),
             WindowEvent::KeyboardInput { event, .. } => {
@@ -141,11 +145,16 @@ impl App {
 
     fn snap_north_up(&mut self) {
         self.camera_controller.reset_zoom();
+
         if !self.tiles.is_empty() {
             let center = 0.5 * (self.world_min + self.world_max);
+
             self.camera.target = center;
-            self.camera.position =
-                center + Vec3::new(0.0, -self.default_distance * 1.35, self.default_distance * 0.9);
+            self.camera.position = center + Vec3::new(
+                0.0,
+                -self.default_distance * 1.35,
+                self.default_distance * 0.9,
+            );
             self.camera.up = Vec3::Z;
         }
     }
@@ -188,6 +197,7 @@ impl App {
             1.0 / self.renderer.context.config.height as f32,
         ];
 
+        // Update EDL post-processing uniforms
         self.renderer.pipelines.post_edl.update_uniforms(
             &self.renderer.context.queue,
             EdlUniforms {
@@ -197,6 +207,7 @@ impl App {
             },
         );
 
+        // Update RGB shift post-processing uniforms
         self.renderer.pipelines.post_rgb.update_uniforms(
             &self.renderer.context.queue,
             RgbShiftUniforms {
@@ -206,6 +217,7 @@ impl App {
             },
         );
 
+        // Update CRT post-processing uniforms
         self.renderer.pipelines.post_crt.update_uniforms(
             &self.renderer.context.queue,
             CrtUniforms {
@@ -217,22 +229,23 @@ impl App {
             },
         );
 
-        let (lon_min, lat_min, lon_span, lat_span, enable_grid) =
-            if let Some(bb) = &self.geot_union {
-                (
-                    bb.lon_min as f32,
-                    bb.lat_min as f32,
-                    (bb.lon_max - bb.lon_min) as f32,
-                    (bb.lat_max - bb.lat_min) as f32,
-                    if self.grid_enabled { 1u32 } else { 0u32 },
-                )
-            } else {
-                (0.0, 0.0, 0.0, 0.0, 0u32)
-            };
+        // Compute grid uniform values
+        let (lon_min, lat_min, lon_span, lat_span, enable_grid) = if let Some(bb) = &self.geot_union {
+            (
+                bb.lon_min as f32,
+                bb.lat_min as f32,
+                (bb.lon_max - bb.lon_min) as f32,
+                (bb.lat_max - bb.lat_min) as f32,
+                if self.grid_enabled { 1u32 } else { 0u32 },
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0, 0u32)
+        };
 
         let extent = (dmax - dmin).abs();
         let z_offset = extent.z.max(1e-6) * 0.02;
 
+        // Update ground grid uniforms
         self.renderer.pipelines.ground_grid.update_uniforms(
             &self.renderer.context.queue,
             GridUniforms {
@@ -262,13 +275,12 @@ impl App {
         let swap_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder =
-            self.renderer
-                .context
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Frame Encoder"),
-                });
+
+        let mut encoder = self.renderer.context.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor {
+                label: Some("Frame Encoder"),
+            },
+        );
 
         self.renderer.render(&mut encoder, &swap_view, &self.tiles);
 
@@ -287,10 +299,7 @@ impl App {
             altitude,
         );
 
-        self.renderer
-            .context
-            .queue
-            .submit(std::iter::once(encoder.finish()));
+        self.renderer.context.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
 
         Ok(())
@@ -300,14 +309,12 @@ impl App {
         WalkDir::new(root)
             .into_iter()
             .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file())
-            .filter_map(|e| {
-                let path = e.path();
-                if path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .map_or(false, |ext| ext.eq_ignore_ascii_case("hypc"))
-                {
+            .filter(|entry| entry.file_type().is_file())
+            .filter_map(|entry| {
+                let path = entry.path();
+                let extension = path.extension().and_then(|s| s.to_str());
+
+                if extension.map_or(false, |ext| ext.eq_ignore_ascii_case("hypc")) {
                     Some(path.to_string_lossy().to_string())
                 } else {
                     None
@@ -317,7 +324,7 @@ impl App {
     }
 
     pub fn build_all_tiles(&mut self, root: &str) -> Result<()> {
-        use crate::data::point_cloud::{GeoExtentDeg, QuantizedPointCloud};
+        use crate::data::{GeoExtentDeg, QuantizedPointCloud};
         use crate::renderer::pipelines::hologram::{Instance, TileUniforms};
 
         let paths = Self::scan_hypc_files(root);
@@ -362,6 +369,7 @@ impl App {
             lon_max: f64::NEG_INFINITY,
             lat_max: f64::NEG_INFINITY,
         };
+
         for l in &loaded {
             let bb = l.pc.geog_bbox_deg.as_ref().unwrap();
             geot_union.lon_min = geot_union.lon_min.min(bb.lon_min);
@@ -389,6 +397,7 @@ impl App {
             let lat_span_union = (geot_union.lat_max - geot_union.lat_min) as f32;
             let decode_span_x = (decode_max.x - decode_min.x).abs();
             let decode_span_y = (decode_max.y - decode_min.y).abs();
+
             let sz_ref = (self.mdeg_lon_ref as f32 * lon_span_union
                 + self.mdeg_lat_ref as f32 * lat_span_union)
                 / (decode_span_x + decode_span_y).max(1e-6)
@@ -408,8 +417,10 @@ impl App {
                     let x_world = ((lon - self.lon0) * self.mdeg_lon_ref) as f32;
                     let y_world = ((lat - self.lat0) * self.mdeg_lat_ref) as f32;
                     let z_world = (p.z - decode_min.z) * sz_ref;
+
                     world_min = world_min.min(Vec3::new(x_world, y_world, z_world));
                     world_max = world_max.max(Vec3::new(x_world, y_world, z_world));
+
                     [x_world, y_world, z_world]
                 })
                 .collect();
@@ -419,6 +430,7 @@ impl App {
                 ((geot.lat_min - self.lat0) * self.mdeg_lat_ref) as f32,
                 0.0,
             );
+
             let dmax_world = Vec3::new(
                 ((geot.lon_max - self.lon0) * self.mdeg_lon_ref) as f32,
                 ((geot.lat_max - self.lat0) * self.mdeg_lat_ref) as f32,
@@ -432,15 +444,14 @@ impl App {
                 .iter()
                 .map(|pos| Instance { position: *pos })
                 .collect();
-            let vb =
-                self.renderer
-                    .context
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some(&format!("Instances({})", l.name)),
-                        contents: bytemuck::cast_slice(&instances),
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    });
+
+            let vb = self.renderer.context.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("Instances({})", l.name)),
+                    contents: bytemuck::cast_slice(&instances),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                },
+            );
 
             let (sem_tex, sem_view, sem_samp) =
                 self.renderer.upload_semantic_mask(pc.semantic_mask.as_ref());
@@ -459,35 +470,33 @@ impl App {
                 xy_bias: [0.0, 0.0],
                 _padding: [0u32; 22],
             };
-            let tile_ubo =
-                self.renderer
-                    .context
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some(&format!("Tile UBO ({})", l.name)),
-                        contents: bytemuck::bytes_of(&tile_uniforms),
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    });
-            let tile_bg =
-                self.renderer
-                    .context
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("Holo BG (tile)"),
-                        layout: &self.renderer.pipelines.hologram.bgl_tile,
-                        entries: &[wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: tile_ubo.as_entire_binding(),
-                        }],
-                    });
+
+            let tile_ubo = self.renderer.context.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some(&format!("Tile UBO ({})", l.name)),
+                    contents: bytemuck::bytes_of(&tile_uniforms),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                },
+            );
+
+            let tile_bg = self.renderer.context.device.create_bind_group(
+                &wgpu::BindGroupDescriptor {
+                    label: Some("Holo BG (tile)"),
+                    layout: &self.renderer.pipelines.hologram.bgl_tile,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: tile_ubo.as_entire_binding(),
+                    }],
+                },
+            );
 
             tiles.push(TileDraw {
                 name: l.name,
                 vb,
                 count: pc.kept as u32,
                 sem_tex,
-                sem_view, // Corrected: Type now matches
-                sem_samp, // Corrected: Type now matches
+                sem_view,
+                sem_samp,
                 holo_bg,
                 tile_ubo,
                 tile_bg,
@@ -509,10 +518,8 @@ impl App {
             );
             tile.z_bias = *bias_z.get(i).unwrap_or(&0.0);
 
-            let dmin_biased =
-                tile.dmin_world + glam::Vec3::new(tile.xy_bias.x, tile.xy_bias.y, 0.0);
-            let dmax_biased =
-                tile.dmax_world + glam::Vec3::new(tile.xy_bias.x, tile.xy_bias.y, 0.0);
+            let dmin_biased = tile.dmin_world + glam::Vec3::new(tile.xy_bias.x, tile.xy_bias.y, 0.0);
+            let dmax_biased = tile.dmax_world + glam::Vec3::new(tile.xy_bias.x, tile.xy_bias.y, 0.0);
 
             let tile_uniforms = TileUniforms {
                 dmin_world: [dmin_biased.x, dmin_biased.y],
@@ -522,14 +529,17 @@ impl App {
                 xy_bias: [tile.xy_bias.x, tile.xy_bias.y],
                 _padding: [0u32; 22],
             };
-            self.renderer
-                .context
-                .queue
-                .write_buffer(&tile.tile_ubo, 0, bytemuck::bytes_of(&tile_uniforms));
+
+            self.renderer.context.queue.write_buffer(
+                &tile.tile_ubo,
+                0,
+                bytemuck::bytes_of(&tile_uniforms),
+            );
         }
 
         let mut world_min_biased = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
         let mut world_max_biased = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+
         for tile in &tiles {
             world_min_biased = world_min_biased.min(tile.dmin_world);
             world_max_biased = world_max_biased.max(tile.dmax_world);
@@ -544,13 +554,14 @@ impl App {
         let extent = self.world_max - self.world_min;
         let max_dimension = extent.x.max(extent.y).max(extent.z);
         let distance = max_dimension * 1.2;
+
         self.default_distance = distance;
         self.camera_controller.set_default_distance(distance);
 
         let center = 0.5 * (self.world_min + self.world_max);
         self.camera.target = center;
-        self.camera.position =
-            center + Vec3::new(0.25 * distance, -1.35 * distance, 0.9 * distance);
+        self.camera.position = center
+            + Vec3::new(0.25 * distance, -1.35 * distance, 0.9 * distance);
 
         Ok(())
     }

@@ -1,5 +1,4 @@
 // src/renderer/pipelines/hologram.rs
-// NOTE: Renamed HoloPipelines -> HologramPipeline for consistency. Otherwise identical.
 
 use wgpu::util::DeviceExt;
 use glam::{Mat4, Vec3};

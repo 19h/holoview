@@ -59,7 +59,7 @@ impl CameraController {
             WindowEvent::MouseWheel { delta, .. } => {
                 let scroll_delta = match delta {
                     MouseScrollDelta::LineDelta(_, y) => *y,
-                    MouseScrollDelta::PixelDelta(pos) => (pos.y as f32) / 120.0,
+                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 120.0,
                 };
                 self.handle_scroll(scroll_delta, camera);
             }
@@ -92,6 +92,7 @@ impl CameraController {
         }
 
         camera.position = camera.target + offset;
+
         if self.default_distance > 0.0 {
             self.zoom_factor = self.default_distance / offset.length();
         }
@@ -123,6 +124,7 @@ impl CameraController {
                 camera.position = camera.target - dir * current_dist;
             }
         }
+
         self.last_mouse = Some(xy);
     }
 }

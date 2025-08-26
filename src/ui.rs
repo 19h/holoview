@@ -28,18 +28,64 @@ pub fn draw_hud(
         let color = egui::Color32::from_rgba_unmultiplied(45, 247, 255, 200);
         let (thickness, margin, length) = (2.0, 26.0, 140.0);
 
-        // Top-left
-        painter.line_segment([egui::pos2(margin, margin), egui::pos2(margin + length, margin)], (thickness, color));
-        painter.line_segment([egui::pos2(margin, margin), egui::pos2(margin, margin + length)], (thickness, color));
-        // Top-right
-        painter.line_segment([egui::pos2(rect.max.x - margin - length, margin), egui::pos2(rect.max.x - margin, margin)], (thickness, color));
-        painter.line_segment([egui::pos2(rect.max.x - margin, margin), egui::pos2(rect.max.x - margin, margin + length)], (thickness, color));
-        // Bottom-left
-        painter.line_segment([egui::pos2(margin, rect.max.y - margin), egui::pos2(margin + length, rect.max.y - margin)], (thickness, color));
-        painter.line_segment([egui::pos2(margin, rect.max.y - margin - length), egui::pos2(margin, rect.max.y - margin)], (thickness, color));
-        // Bottom-right
-        painter.line_segment([egui::pos2(rect.max.x - margin - length, rect.max.y - margin), egui::pos2(rect.max.x - margin, rect.max.y - margin)], (thickness, color));
-        painter.line_segment([egui::pos2(rect.max.x - margin, rect.max.y - margin - length), egui::pos2(rect.max.x - margin, rect.max.y - margin)], (thickness, color));
+        // Top-left bracket
+        painter.line_segment(
+            [egui::pos2(margin, margin), egui::pos2(margin + length, margin)],
+            (thickness, color),
+        );
+        painter.line_segment(
+            [egui::pos2(margin, margin), egui::pos2(margin, margin + length)],
+            (thickness, color),
+        );
+
+        // Top-right bracket
+        painter.line_segment(
+            [
+                egui::pos2(rect.max.x - margin - length, margin),
+                egui::pos2(rect.max.x - margin, margin),
+            ],
+            (thickness, color),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.max.x - margin, margin),
+                egui::pos2(rect.max.x - margin, margin + length),
+            ],
+            (thickness, color),
+        );
+
+        // Bottom-left bracket
+        painter.line_segment(
+            [
+                egui::pos2(margin, rect.max.y - margin),
+                egui::pos2(margin + length, rect.max.y - margin),
+            ],
+            (thickness, color),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(margin, rect.max.y - margin - length),
+                egui::pos2(margin, rect.max.y - margin),
+            ],
+            (thickness, color),
+        );
+
+        // Bottom-right bracket
+        painter.line_segment(
+            [
+                egui::pos2(rect.max.x - margin - length, rect.max.y - margin),
+                egui::pos2(rect.max.x - margin, rect.max.y - margin),
+            ],
+            (thickness, color),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.max.x - margin, rect.max.y - margin - length),
+                egui::pos2(rect.max.x - margin, rect.max.y - margin),
+            ],
+            (thickness, color),
+        );
+
         // Top-center dot
         painter.circle_filled(egui::pos2(rect.center().x, 16.0), 3.0, color);
     }
@@ -47,6 +93,7 @@ pub fn draw_hud(
     // Top-left status text
     {
         use egui::{Area, Frame, RichText};
+
         Area::new("hud_text".into())
             .interactable(false)
             .movable(false)
@@ -55,10 +102,29 @@ pub fn draw_hud(
             .show(egui_ctx, |ui| {
                 Frame::none().show(ui, |ui| {
                     let text_color = egui::Color32::from_rgb(45, 247, 255);
-                    ui.label(RichText::new("HOLOGRAPHIC  SCAN  ACTIVE").monospace().color(text_color).size(16.0).strong());
-                    ui.label(RichText::new(format!("RESOLUTION: {:>11} POINTS", total_points)).monospace().color(text_color));
-                    ui.label(RichText::new(format!("ALTITUDE: {}M", altitude)).monospace().color(text_color));
-                    ui.label(RichText::new("STATUS:  SCAN  COMPLETE").monospace().color(text_color));
+
+                    ui.label(
+                        RichText::new("HOLOGRAPHIC  SCAN  ACTIVE")
+                            .monospace()
+                            .color(text_color)
+                            .size(16.0)
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new(format!("RESOLUTION: {:>11} POINTS", total_points))
+                            .monospace()
+                            .color(text_color),
+                    );
+                    ui.label(
+                        RichText::new(format!("ALTITUDE: {}M", altitude))
+                            .monospace()
+                            .color(text_color),
+                    );
+                    ui.label(
+                        RichText::new("STATUS:  SCAN  COMPLETE")
+                            .monospace()
+                            .color(text_color),
+                    );
                 });
             });
     }
@@ -90,12 +156,16 @@ pub fn draw_hud(
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: swap_view,
                 resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+
         egui_renderer.render(&mut render_pass, &shapes, &screen_descriptor);
     }
 
