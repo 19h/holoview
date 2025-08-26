@@ -1,0 +1,10 @@
+[package]
+name = "hypc"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Reader/writer for HPC1 point clouds with SMC1 and GEOT chunks."
+
+[dependencies]
+anyhow = "1.0"
+miniz_oxide = "0.8.9"
