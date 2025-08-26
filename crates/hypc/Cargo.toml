@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Reader/writer for HPC1 point clouds with SMC1 and GEOT chunks."
+readme = "readme.md"
 
 [dependencies]
 anyhow = "1.0"
