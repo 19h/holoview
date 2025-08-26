@@ -23,16 +23,27 @@ use osmpbf::{Element, ElementReader, Way};
 use rstar::{RTree, RTreeObject, AABB};
 use smallvec::SmallVec;
 
+// hypc crate for writing the final file format
 use hypc::{self, GeoCrs, GeoExtentDeg, HypcWrite, SemanticMask as Smc1, Smc1Encoding, TileKey};
 
 /// The program performs the following high‑level steps:
+///
 /// 1. Initialise logging and parse command‑line arguments.
 /// 2. Ensure the output directory exists.
-/// 3. Scan input for `.zip` and `.obj`.
-/// 4. Build work list (optionally from feature index with per‑tile bbox).
-/// 5. Optionally build OSM overlays (per‑tile).
-/// 6. For each tile, quantize and write `.hypc` using the `hypc` crate.
-/// 7. Report timing.
+/// 3. Scan the input directory for `.zip` and `.obj` files and build a
+///    `LocalIndex` for fast lookup by filename prefix.
+/// 4. Construct the list of work items either from a supplied GeoJSON feature
+///    index (providing a bounding box per tile) or, when no index is given,
+///    from the discovered filenames alone.
+/// 5. Optionally build per‑tile OSM semantic overlays if an OSM PBF file is
+///    supplied; the result is placed in an `Arc<OverlayMap>` so it can be shared
+///    across threads.
+/// 6. Process each work item in parallel using Rayon:
+///    * Resolve the mesh file path via the local index.
+///    * Retrieve the corresponding overlay, if any.
+///    * Call `process_one_mesh` which writes the `.hypc` file, optionally
+///      appending a semantic mask (SMC1) and a GEOT footer.
+/// 7. Report overall timing information.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "obj2hypc", version)]
 struct Args {
@@ -98,7 +109,7 @@ struct WorkItem {
 
 #[derive(Debug, serde::Deserialize)]
 struct GeoJsonRoot {
-    #[serde(rename="type")]
+    #[serde(rename = "type")]
     r#type: String,
     name: String,
     features: Vec<Feature>,
@@ -106,7 +117,7 @@ struct GeoJsonRoot {
 
 #[derive(Debug, serde::Deserialize)]
 struct Feature {
-    #[serde(rename="type")]
+    #[serde(rename = "type")]
     r#type: String,
     geometry: Geometry,
     properties: Properties,
@@ -114,7 +125,7 @@ struct Feature {
 
 #[derive(Debug, serde::Deserialize)]
 struct Geometry {
-    #[serde(rename="type")]
+    #[serde(rename = "type")]
     r#type: String,
     // GeoJSON Polygon: coordinates[0] is an outer ring: [[lon,lat],...]
     coordinates: Vec<Vec<[f64; 2]>>,
@@ -135,15 +146,32 @@ struct GeoBboxDeg {
 
 fn bbox_from_polygon_deg(poly: &Geometry) -> GeoBboxDeg {
     let ring = &poly.coordinates[0];
-    let (mut xmin, mut ymin, mut xmax, mut ymax) =
-        (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let (mut xmin, mut ymin, mut xmax, mut ymax) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
     for [lon, lat] in ring {
-        if *lon < xmin { xmin = *lon; }
-        if *lon > xmax { xmax = *lon; }
-        if *lat < ymin { ymin = *lat; }
-        if *lat > ymax { ymax = *lat; }
+        if *lon < xmin {
+            xmin = *lon;
+        }
+        if *lon > xmax {
+            xmax = *lon;
+        }
+        if *lat < ymin {
+            ymin = *lat;
+        }
+        if *lat > ymax {
+            ymax = *lat;
+        }
     }
-    GeoBboxDeg { lon_min: xmin, lat_min: ymin, lon_max: xmax, lat_max: ymax }
+    GeoBboxDeg {
+        lon_min: xmin,
+        lat_min: ymin,
+        lon_max: xmax,
+        lat_max: ymax,
+    }
 }
 
 fn load_feature_index(path: &str) -> anyhow::Result<Vec<WorkItem>> {
@@ -178,8 +206,8 @@ fn load_feature_index(path: &str) -> anyhow::Result<Vec<WorkItem>> {
 
 #[derive(Default)]
 struct LocalIndex {
-    exact: HashMap<String, PathBuf>,          // exact basename -> best path
-    names: BTreeMap<String, Vec<PathBuf>>,    // for starts_with scans
+    exact: HashMap<String, PathBuf>,       // exact basename -> best path
+    names: BTreeMap<String, Vec<PathBuf>>, // for starts_with scans
 }
 
 fn build_local_index(input_dir: &str) -> LocalIndex {
@@ -195,7 +223,9 @@ fn build_local_index(input_dir: &str) -> LocalIndex {
         .filter_map(Result::ok);
 
     for entry in walker {
-        if !entry.file_type().is_file() { continue; }
+        if !entry.file_type().is_file() {
+            continue;
+        }
         total_files += 1;
 
         let path = entry.into_path();
@@ -224,10 +254,7 @@ fn build_local_index(input_dir: &str) -> LocalIndex {
         idx.exact
             .entry(stem.clone())
             .and_modify(|existing| {
-                let existing_ext = existing
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
+                let existing_ext = existing.extension().and_then(|s| s.to_str()).unwrap_or("");
                 let prefer_new = existing_ext.eq_ignore_ascii_case("obj") && ext == "zip";
                 if prefer_new {
                     *existing = path.clone();
@@ -238,20 +265,33 @@ fn build_local_index(input_dir: &str) -> LocalIndex {
 
     info!(
         "Local index built: scanned {} files, found {} .zip/.obj files in {:.2?}",
-        total_files, matched_files, start.elapsed()
+        total_files,
+        matched_files,
+        start.elapsed()
     );
 
     idx
 }
 
 fn resolve_by_prefix(idx: &LocalIndex, prefix: &str, prefer_zip: bool) -> Option<PathBuf> {
-    if let Some(p) = idx.exact.get(prefix) { return Some(p.clone()); }
+    if let Some(p) = idx.exact.get(prefix) {
+        return Some(p.clone());
+    }
     for (name, paths) in idx.names.range(prefix.to_string()..) {
-        if !name.starts_with(prefix) { break; }
-        if paths.is_empty() { continue; }
-        if !prefer_zip { return Some(paths[0].clone()); }
+        if !name.starts_with(prefix) {
+            break;
+        }
+        if paths.is_empty() {
+            continue;
+        }
+        if !prefer_zip {
+            return Some(paths[0].clone());
+        }
         if let Some(zip_path) = paths.iter().find(|p| {
-            p.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("zip")).unwrap_or(false)
+            p.extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("zip"))
+                .unwrap_or(false)
         }) {
             return Some(zip_path.clone());
         }
@@ -262,14 +302,12 @@ fn resolve_by_prefix(idx: &LocalIndex, prefix: &str, prefer_zip: bool) -> Option
 
 // ---------------- TileKey helpers ----------------
 
-const FLAG_TILEKEY_PRESENT: u32 = 1 << 0;
-
-#[repr(u8)]
-enum KeyType { XY = 0, NameHash64 = 4 }
-
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
     h
 }
 
@@ -310,7 +348,7 @@ fn to_hypc_geot(bb: GeoBboxDeg) -> GeoExtentDeg {
     }
 }
 
-// ---------------- Quantization (unchanged) ----------------
+// ---------------- Quantization ----------------
 
 fn quantize_positions(
     positions: &[f32],
@@ -322,36 +360,65 @@ fn quantize_positions(
     let (mut maxx, mut maxy, mut maxz) = (minx, miny, minz);
     let mut i = 3;
     while i < positions.len() {
-        let x = positions[i]; let y = positions[i+1]; let z = positions[i+2];
-        if x < minx { minx = x; } if y < miny { miny = y; } if z < minz { minz = z; }
-        if x > maxx { maxx = x; } if y > maxy { maxy = y; } if z > maxz { maxz = z; }
+        let x = positions[i];
+        let y = positions[i + 1];
+        let z = positions[i + 2];
+        if x < minx {
+            minx = x;
+        }
+        if y < miny {
+            miny = y;
+        }
+        if z < minz {
+            minz = z;
+        }
+        if x > maxx {
+            maxx = x;
+        }
+        if y > maxy {
+            maxy = y;
+        }
+        if z > maxz {
+            maxz = z;
+        }
         i += 3;
     }
-    let sx=(maxx-minx).max(0.0); let sy=(maxy-miny).max(0.0); let sz=(maxz-minz).max(0.0);
-    let eps=1e-20f32;
+    let sx = (maxx - minx).max(0.0);
+    let sy = (maxy - miny).max(0.0);
+    let sz = (maxz - minz).max(0.0);
+    let eps = 1e-20f32;
     let scale = target_extent / sx.max(sy).max(sz).max(eps);
-    let dx=0.5*sx*scale; let dy=0.5*sy*scale; let dz=0.5*sz*scale;
-    let decode_min=[-dx,-dy,-dz]; let decode_max=[dx,dy,dz];
+    let dx = 0.5 * sx * scale;
+    let dy = 0.5 * sy * scale;
+    let dz = 0.5 * sz * scale;
+
+    // Keep original z-center to preserve relative vertical offsets between tiles
+    let z_center = 0.5 * (minz + maxz);
+    let decode_min = [-dx, -dy, z_center * scale - dz];
+    let decode_max = [dx, dy, z_center * scale + dz];
 
     let stride = ((n + point_budget - 1) / point_budget).max(1);
-    let m = n / stride; let step = stride*3;
+    let m = n / stride;
+    let step = stride * 3;
 
-    let u=65535.0f32;
-    let qx=u/sx.max(eps); let qy=u/sy.max(eps); let qz=u/sz.max(eps);
+    let u = 65535.0f32;
+    let qx = u / sx.max(eps);
+    let qy = u / sy.max(eps);
+    let qz = u / sz.max(eps);
 
-    let mut q=Vec::<u16>::with_capacity(m*3);
-    let mut src=0usize;
+    let mut q = Vec::<u16>::with_capacity(m * 3);
+    let mut src = 0usize;
     for _ in 0..m {
-        let qxv = (((positions[src]   - minx) * qx + 0.5).floor().clamp(0.0,u)) as u16;
-        let qyv = (((positions[src+1] - miny) * qy + 0.5).floor().clamp(0.0,u)) as u16;
-        let qzv = (((positions[src+2] - minz) * qz + 0.5).floor().clamp(0.0,u)) as u16;
-        q.extend_from_slice(&[qxv,qyv,qzv]);
+        let qxv = (((positions[src] - minx) * qx + 0.5).floor().clamp(0.0, u)) as u16;
+        let qyv = (((positions[src + 1] - miny) * qy + 0.5).floor().clamp(0.0, u)) as u16;
+        let qzv = (((positions[src + 2] - minz) * qz + 0.5).floor().clamp(0.0, u)) as u16;
+        q.extend_from_slice(&[qxv, qyv, qzv]);
         src += step;
     }
     (q, m, decode_min, decode_max)
 }
 
-// ---------------- OBJ parsing (unchanged) ----------------
+// ---------------- OBJ parsing ----------------
 
 fn parse_obj_vertices<R: Read>(r: R) -> Result<Vec<f32>> {
     let mut rd = BufReader::new(r);
@@ -360,15 +427,28 @@ fn parse_obj_vertices<R: Read>(r: R) -> Result<Vec<f32>> {
     loop {
         line.clear();
         let n = rd.read_line(&mut line)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         let bytes = line.as_bytes();
-        if bytes.len() < 2 || bytes[0] != b'v' || bytes[1] != b' ' { continue; }
+        if bytes.len() < 2 || bytes[0] != b'v' || bytes[1] != b' ' {
+            continue;
+        }
         let mut it = line.split_whitespace();
         it.next();
-        let x = match it.next().and_then(|s| s.parse::<f32>().ok()) { Some(v) => v, None => continue };
-        let y = match it.next().and_then(|s| s.parse::<f32>().ok()) { Some(v) => v, None => continue };
-        let z = match it.next().and_then(|s| s.parse::<f32>().ok()) { Some(v) => v, None => continue };
-        out.extend_from_slice(&[x,y,z]);
+        let x = match it.next().and_then(|s| s.parse::<f32>().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let y = match it.next().and_then(|s| s.parse::<f32>().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let z = match it.next().and_then(|s| s.parse::<f32>().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        out.extend_from_slice(&[x, y, z]);
     }
     Ok(out)
 }
@@ -381,16 +461,16 @@ fn parse_obj_vertices<R: Read>(r: R) -> Result<Vec<f32>> {
 #[repr(u8)]
 #[derive(Clone, Copy)]
 enum SemClass {
-    Unknown   = 0,
-    Building  = 1,
+    Unknown = 0,
+    Building = 1,
     RoadMajor = 2,
     RoadMinor = 3,
-    Path      = 4,
-    Water     = 5,
-    Park      = 6,
-    Woodland  = 7,
-    Railway   = 8,
-    Parking   = 9,
+    Path = 4,
+    Water = 5,
+    Park = 6,
+    Woodland = 7,
+    Railway = 8,
+    Parking = 9,
 }
 
 #[inline(always)]
@@ -409,9 +489,16 @@ fn class_precedence(c: u8) -> u8 {
 }
 
 #[derive(Clone)]
-struct Polyline { class: u8, width_m: f32, pts: Arc<Vec<(f64,f64)>> }
+struct Polyline {
+    class: u8,
+    width_m: f32,
+    pts: Arc<Vec<(f64, f64)>>,
+}
 #[derive(Clone)]
-struct Polygon  { class: u8, ring: Arc<Vec<(f64,f64)>> }
+struct Polygon {
+    class: u8,
+    ring: Arc<Vec<(f64, f64)>>,
+}
 
 #[derive(Default, Clone)]
 struct SemOverlayPerTile {
@@ -421,8 +508,37 @@ struct SemOverlayPerTile {
 
 type OverlayMap = HashMap<String, SemOverlayPerTile>;
 
-// TileBox/RTree and overlay builder identical to previous version omitted for brevity in review.
-// (Full code remains exactly as in your provided file; only writer call changes.)
+#[derive(Clone)]
+struct NodeRec {
+    lon: f64,
+    lat: f64,
+    tiles: SmallVec<[u32; 4]>, // tile indices this node touches
+}
+
+struct Tick {
+    start: Instant,
+    last: Instant,
+    every: usize,
+}
+impl Tick {
+    fn new(every: usize) -> Self {
+        Self {
+            start: Instant::now(),
+            last: Instant::now(),
+            every,
+        }
+    }
+    fn should(&mut self, count: usize) -> bool {
+        count % self.every == 0 && self.last.elapsed() >= Duration::from_millis(200)
+    }
+    fn bump(&mut self) {
+        self.last = Instant::now();
+    }
+    fn rate_mps(&self, count: usize) -> f64 {
+        let secs = self.start.elapsed().as_secs_f64().max(1e-9);
+        (count as f64) / 1.0e6 / secs
+    }
+}
 
 // ---- Utils for meters->degrees padding ----
 #[inline]
@@ -433,20 +549,752 @@ fn pad_degrees_for(lat_deg: f64, pad_m: f64) -> (f64, f64) {
     (pad_m / m_per_deg_lat, pad_m / m_per_deg_lon)
 }
 
-// ... [OSM overlay builder functions from your original code remain unchanged]
-// ... build_osm_overlays(..) and prefilter_with_osmium(..) are identical to the version you supplied.
-// (They are long and were not modified; keep them verbatim.)
-// For completeness in your repo, retain the exact implementations you posted.
+// Width defaults (meters) for highways (very lightweight model)
+#[inline]
+fn default_highway_width_m(kind: &str, lanes: Option<u32>, width: Option<f32>) -> (u8, f32) {
+    // If an explicit width is provided, use it (minimum 1.0m) and map the road kind to a class.
+    if let Some(w) = width {
+        let class = match kind {
+            "motorway" | "trunk" | "primary" => SemClass::RoadMajor as u8,
+            "secondary" | "tertiary" | "residential" | "service" => SemClass::RoadMinor as u8,
+            _ => SemClass::Path as u8,
+        };
+        return (class, w.max(1.0));
+    }
+
+    // No explicit width – compute from lane count or fall back to defaults.
+    let lanes_f = lanes.unwrap_or(0) as f32;
+    let lane_width = 3.2_f32;
+
+    let base_width = match kind {
+        "motorway" => 12.0,
+        "trunk" => 10.0,
+        "primary" => 8.0,
+        "secondary" => 7.0,
+        "tertiary" => 6.0,
+        "residential" | "service" => 5.0,
+        _ => 2.0,
+    };
+
+    let width_m = if lanes_f >= 2.0 {
+        (lanes_f * lane_width).max(base_width)
+    } else {
+        base_width
+    };
+
+    let class = match kind {
+        "motorway" | "trunk" | "primary" => SemClass::RoadMajor as u8,
+        "secondary" | "tertiary" | "residential" | "service" => SemClass::RoadMinor as u8,
+        _ => SemClass::Path as u8,
+    };
+
+    (class, width_m)
+}
+
+#[inline]
+fn parse_width_m(s: &str) -> Option<f32> {
+    let t = s.trim().to_ascii_lowercase();
+
+    if let Some(v) = t.strip_suffix('m') {
+        return v.trim().parse::<f32>().ok();
+    }
+
+    if let Some(v) = t.strip_suffix("ft") {
+        return v.trim().parse::<f32>().ok().map(|x| x * 0.3048);
+    }
+
+    t.parse::<f32>().ok()
+}
+
+fn union_bbox(tiles: &[WorkItem], pad_m: f64) -> Option<GeoBboxDeg> {
+    // Start with an "empty" bbox using infinities.
+    let mut bb = GeoBboxDeg {
+        lon_min: f64::INFINITY,
+        lat_min: f64::INFINITY,
+        lon_max: f64::NEG_INFINITY,
+        lat_max: f64::NEG_INFINITY,
+    };
+
+    for tile in tiles {
+        if let Some(b) = tile.bbox {
+            // Pad the tile's bbox, converting the padding from metres to degrees.
+            let lat_center = 0.5 * (b.lat_min + b.lat_max);
+            let (pad_lat, pad_lon) = pad_degrees_for(lat_center, pad_m);
+
+            bb.lon_min = bb.lon_min.min(b.lon_min - pad_lon);
+            bb.lat_min = bb.lat_min.min(b.lat_min - pad_lat);
+            bb.lon_max = bb.lon_max.max(b.lon_max + pad_lon);
+            bb.lat_max = bb.lat_max.max(b.lat_max + pad_lat);
+        }
+    }
+
+    if bb.lon_min.is_finite() {
+        Some(bb)
+    } else {
+        None
+    }
+}
+
+fn classify_way(w: &Way) -> Option<(u8 /* class */, f32 /* width_m */, bool /* is_area */)> {
+    // Collect all tags of the way into a vector for easy lookup.
+    let tags: Vec<(&str, &str)> = w.tags().collect();
+
+    // Helper closure to retrieve the value of a tag by its key.
+    let find_tag = |key: &str| -> Option<&str> {
+        tags.iter()
+            .find_map(|(k, v)| if *k == key { Some(*v) } else { None })
+    };
+
+    // Buildings – always an area.
+    if let Some(b) = find_tag("building") {
+        if !b.is_empty() || b == "yes" {
+            return Some((SemClass::Building as u8, 0.0, true));
+        }
+    }
+
+    // Highways – linear features with a width.
+    if let Some(highway) = find_tag("highway") {
+        let lanes = find_tag("lanes").and_then(|v| v.parse::<u32>().ok());
+
+        let width = find_tag("width").and_then(|v| parse_width_m(v));
+
+        let (class_id, width_m) = default_highway_width_m(highway, lanes, width);
+        return Some((class_id, width_m, false));
+    }
+
+    // Natural water bodies.
+    if let Some(natural) = find_tag("natural") {
+        if natural == "water" {
+            return Some((SemClass::Water as u8, 0.0, true));
+        }
+    }
+
+    // Waterways – we only care about polygons (riverbanks).
+    if let Some(waterway) = find_tag("waterway") {
+        if waterway == "riverbank" {
+            return Some((SemClass::Water as u8, 0.0, true));
+        }
+        // Other waterway types (e.g., streams) are ignored here.
+    }
+
+    // Land‑use categories.
+    if let Some(landuse) = find_tag("landuse") {
+        if matches!(landuse, "forest" | "grass" | "meadow" | "reservoir") {
+            let class_id = match landuse {
+                "forest" => SemClass::Woodland as u8,
+                _ => SemClass::Park as u8,
+            };
+            return Some((class_id, 0.0, true));
+        }
+    }
+
+    // Leisure areas.
+    if let Some(leisure) = find_tag("leisure") {
+        if matches!(leisure, "park" | "pitch") {
+            return Some((SemClass::Park as u8, 0.0, true));
+        }
+    }
+
+    // Railway lines – treated as linear features with a default width.
+    if let Some(railway) = find_tag("railway") {
+        if !railway.is_empty() {
+            // Width 4m is a reasonable default for visualisation.
+            return Some((SemClass::Railway as u8, 4.0, false));
+        }
+    }
+
+    // Parking areas.
+    if let Some(amenity) = find_tag("amenity") {
+        if amenity == "parking" {
+            return Some((SemClass::Parking as u8, 0.0, true));
+        }
+    }
+
+    // No known classification.
+    None
+}
+
+/// Build per-tile OSM overlays by streaming the PBF in two passes.
+/// Pass A: collect nodes within expanded tile boxes; Pass B: collect ways touching those nodes.
+fn build_osm_overlays(
+    pbf_path: &str,
+    tiles: &[WorkItem],
+    margin_m: f64,
+    log_every: usize,
+    prefilter: bool,
+) -> Result<OverlayMap> {
+    // Require bbox per tile
+    for t in tiles {
+        if t.bbox.is_none() {
+            anyhow::bail!("--osm-pbf requires --feature-index with bbox per tile");
+        }
+    }
+
+    // Compute and log union bbox of tiles (diagnostic)
+    let mut u = GeoBboxDeg {
+        lon_min: f64::INFINITY,
+        lat_min: f64::INFINITY,
+        lon_max: f64::NEG_INFINITY,
+        lat_max: f64::NEG_INFINITY,
+    };
+
+    for t in tiles {
+        let bb = t.bbox.unwrap();
+        u.lon_min = u.lon_min.min(bb.lon_min);
+        u.lat_min = u.lat_min.min(bb.lat_min);
+        u.lon_max = u.lon_max.max(bb.lon_max);
+        u.lat_max = u.lat_max.max(bb.lat_max);
+    }
+
+    info!(
+        "Tiles union bbox: lon[{:.6},{:.6}] lat[{:.6},{:.6}] ({} tiles)",
+        u.lon_min,
+        u.lon_max,
+        u.lat_min,
+        u.lat_max,
+        tiles.len()
+    );
+
+    // Build expanded tile envelopes
+    #[derive(Clone)]
+    struct TileBox {
+        idx: u32,
+        prefix: String,
+        bbox: GeoBboxDeg,
+        env: AABB<[f64; 2]>,
+    }
+
+    impl RTreeObject for TileBox {
+        type Envelope = AABB<[f64; 2]>;
+        #[inline]
+        fn envelope(&self) -> Self::Envelope {
+            self.env
+        }
+    }
+
+    let mut boxes = Vec::<TileBox>::with_capacity(tiles.len());
+
+    for (i, t) in tiles.iter().enumerate() {
+        let bb = t.bbox.unwrap();
+        let lat0 = 0.5 * (bb.lat_min + bb.lat_max);
+        let (pad_lat, pad_lon) = pad_degrees_for(lat0, margin_m);
+        boxes.push(TileBox {
+            idx: i as u32,
+            prefix: t.prefix.clone(),
+            bbox: bb,
+            env: AABB::from_corners(
+                [bb.lon_min - pad_lon, bb.lat_min - pad_lat],
+                [bb.lon_max + pad_lon, bb.lat_max + pad_lat],
+            ),
+        });
+    }
+
+    let tree = RTree::bulk_load(boxes);
+
+    if let Some(ubb) = union_bbox(tiles, margin_m) {
+        info!(
+            "Tiles union bbox (deg): lon [{:.6},{:.6}] lat [{:.6},{:.6}]",
+            ubb.lon_min, ubb.lon_max, ubb.lat_min, ubb.lat_max
+        );
+    }
+
+    // External prefilter (optional)
+    let pbf_source = if prefilter {
+        prefilter_with_osmium(pbf_path, tiles, margin_m).unwrap_or_else(|| pbf_path.to_string())
+    } else {
+        pbf_path.to_string()
+    };
+
+    let mut tile_node_counts: Vec<u32> = vec![0; tiles.len()];
+
+    info!("OSM pass A: collecting nodes near tiles …");
+
+    let mut node_map: FastHashMap<i64, NodeRec, BuildNoHashHasher<i64>> =
+        FastHashMap::with_hasher(BuildNoHashHasher::default());
+
+    let mut total_nodes: usize = 0;
+    let mut kept_nodes: usize = 0;
+    let mut seen_dense: usize = 0;
+    let mut seen_plain: usize = 0;
+
+    let mut tick = Tick::new(log_every.max(1));
+
+    let reader = ElementReader::from_path(&pbf_source)?;
+    reader.for_each(|elem| {
+        match elem {
+            Element::Node(n) => {
+                seen_plain += 1;
+                total_nodes += 1;
+
+                let lon = n.lon();
+                let lat = n.lat();
+                let pt_env = AABB::from_point([lon, lat]);
+
+                let mut tiles_touch = SmallVec::<[u32; 4]>::new();
+
+                for tb in tree.locate_in_envelope_intersecting(&pt_env) {
+                    tiles_touch.push(tb.idx);
+                }
+
+                if !tiles_touch.is_empty() {
+                    // Count per-tile hits *before* moving tiles_touch into NodeRec
+                    for &ti in tiles_touch.iter() {
+                        tile_node_counts[ti as usize] += 1;
+                    }
+                    node_map.insert(
+                        n.id(),
+                        NodeRec {
+                            lon,
+                            lat,
+                            tiles: tiles_touch,
+                        },
+                    );
+                    kept_nodes += 1;
+                }
+            }
+            Element::DenseNode(dn) => {
+                // DenseNode is a single node in a compressed array; handle exactly like Node
+                seen_dense += 1;
+                total_nodes += 1;
+
+                let lon = dn.lon();
+                let lat = dn.lat();
+                let pt_env = AABB::from_point([lon, lat]);
+
+                let mut tiles_touch = SmallVec::<[u32; 4]>::new();
+
+                for tb in tree.locate_in_envelope_intersecting(&pt_env) {
+                    tiles_touch.push(tb.idx);
+                }
+
+                if !tiles_touch.is_empty() {
+                    // Count per-tile hits *before* moving tiles_touch into NodeRec
+                    for &ti in tiles_touch.iter() {
+                        tile_node_counts[ti as usize] += 1;
+                    }
+
+                    node_map.insert(
+                        dn.id(),
+                        NodeRec {
+                            lon,
+                            lat,
+                            tiles: tiles_touch,
+                        },
+                    );
+
+                    kept_nodes += 1;
+                }
+            }
+            _ => {}
+        }
+
+        if tick.should(total_nodes) {
+            info!(
+                "Pass A: nodes seen {:>11} (dense {:>11} / plain {:>11}), kept {:>11} ({:5.1}%), rate {:>5.2} M/s",
+                total_nodes,
+                seen_dense,
+                seen_plain,
+                kept_nodes,
+                100.0 * kept_nodes as f64 / (total_nodes as f64).max(1.0),
+                tick.rate_mps(total_nodes)
+            );
+            tick.bump();
+        }
+    })?;
+
+    info!(
+        "OSM pass A: processed {:>11} nodes (dense {:>11} / plain {:>11}), kept {:>11} ({} tiles touched)",
+        total_nodes,
+        seen_dense,
+        seen_plain,
+        node_map.len(),
+        tiles.len()
+    );
+
+    // Top-10 tiles by retained nodes (debug)
+    if let Some(mut pairs) = {
+        let mut v: Vec<(usize, u32)> = tile_node_counts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, *c))
+            .collect();
+        v.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        if !v.is_empty() {
+            Some(v)
+        } else {
+            None
+        }
+    } {
+        let top = pairs
+            .iter()
+            .take(10)
+            .map(|&(i, c)| (&tiles[i].prefix, c))
+            .collect::<Vec<_>>();
+        debug!("Top tiles by retained nodes (prefix → nodes): {:?}", top);
+    }
+
+    info!("OSM pass B: collecting ways …");
+
+    let mut overlays: OverlayMap = HashMap::new();
+    let mut total_ways: usize = 0;
+    let mut used_ways: usize = 0;
+    let mut tick2 = Tick::new(log_every.max(1));
+
+    let reader2 = ElementReader::from_path(&pbf_source)?;
+    reader2.for_each(|elem| {
+        if let Element::Way(w) = elem {
+            total_ways += 1;
+
+            if let Some((class_id, width_m, is_area)) = classify_way(&w) {
+                let mut coords: Vec<(f64, f64)> = Vec::with_capacity(w.refs().len().min(2048));
+                let mut tiles_hit: SmallVec<[u32; 8]> = SmallVec::new();
+
+                for nr in w.refs() {
+                    if let Some(nrinfo) = node_map.get(&nr) {
+                        coords.push((nrinfo.lon, nrinfo.lat));
+                        for &ti in nrinfo.tiles.iter() {
+                            if !tiles_hit.contains(&ti) {
+                                tiles_hit.push(ti);
+                            }
+                        }
+                    }
+                }
+
+                let need_n = if is_area { 3 } else { 2 };
+
+                if coords.len() >= need_n && !tiles_hit.is_empty() {
+                    used_ways += 1;
+
+                    let coords_arc = Arc::new(coords);
+
+                    for ti in tiles_hit {
+                        let t = &tiles[ti as usize];
+                        let entry = overlays
+                            .entry(t.prefix.clone())
+                            .or_insert_with(SemOverlayPerTile::default);
+
+                        if is_area {
+                            entry.areas.push(Polygon {
+                                class: class_id,
+                                ring: coords_arc.clone(),
+                            });
+                        } else {
+                            entry.roads.push(Polyline {
+                                class: class_id,
+                                width_m,
+                                pts: coords_arc.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            if tick2.should(total_ways) {
+                info!(
+                    "Pass B: ways seen {:>11}, kept {:>11} ({:5.1}%), rate {:>5.2} M/s",
+                    total_ways,
+                    used_ways,
+                    100.0 * used_ways as f64 / (total_ways as f64).max(1.0),
+                    tick2.rate_mps(total_ways)
+                );
+                tick2.bump();
+            }
+        }
+    })?;
+
+    // Coverage summary
+    let tiles_with_overlays = overlays.len();
+    let (mut sum_roads, mut sum_areas) = (0usize, 0usize);
+    for v in overlays.values() {
+        sum_roads += v.roads.len();
+        sum_areas += v.areas.len();
+    }
+    info!(
+        "OSM pass B: processed {} ways; overlays for {} tile(s) (roads {}, areas {})",
+        total_ways, tiles_with_overlays, sum_roads, sum_areas
+    );
+
+    // If zero overlays, print three sample tiles with bbox for debugging.
+    if tiles_with_overlays == 0 {
+        for (i, t) in tiles.iter().take(3).enumerate() {
+            let bb = t.bbox.unwrap();
+            warn!(
+                "No overlays; sample tile[{}] {} bbox lon[{:.6},{:.6}] lat[{:.6},{:.6}]",
+                i, t.prefix, bb.lon_min, bb.lon_max, bb.lat_min, bb.lat_max
+            );
+        }
+    }
+
+    Ok(overlays)
+}
+
+fn prefilter_with_osmium(pbf_in: &str, tiles: &[WorkItem], margin_m: f64) -> Option<String> {
+    use std::process::Command;
+    // Try to detect 'osmium'
+    let Ok(ver) = Command::new("osmium").arg("--version").output() else {
+        warn!("'osmium' not found; skipping external prefilter.");
+        return None;
+    };
+    info!(
+        "Using external prefilter via {}",
+        String::from_utf8_lossy(&ver.stdout).trim()
+    );
+
+    // Union bbox of all tiles (expanded by margin)
+    let mut lon_min = f64::INFINITY;
+    let mut lat_min = f64::INFINITY;
+    let mut lon_max = f64::NEG_INFINITY;
+    let mut lat_max = f64::NEG_INFINITY;
+    for t in tiles {
+        if let Some(bb) = t.bbox {
+            let lat0 = 0.5 * (bb.lat_min + bb.lat_max);
+            let (pad_lat, pad_lon) = pad_degrees_for(lat0, margin_m.max(0.0));
+            lon_min = lon_min.min(bb.lon_min - pad_lon);
+            lon_max = lon_max.max(bb.lon_max + pad_lon);
+            lat_min = lat_min.min(bb.lat_min - pad_lat);
+            lat_max = lat_max.max(bb.lat_max + pad_lat);
+        }
+    }
+    if !lon_min.is_finite() {
+        return None;
+    }
+    let bbox = format!("{},{},{},{}", lon_min, lat_min, lon_max, lat_max);
+
+    // Temp paths
+    let tmp_extract = format!("{}.extract.pbf", pbf_in);
+    let tmp_filtered = format!("{}.filtered.pbf", pbf_in);
+
+    // Extract by bbox
+    let st = Command::new("osmium")
+        .args([
+            "extract",
+            "-b",
+            &bbox,
+            "--overwrite",
+            "-o",
+            &tmp_extract,
+            pbf_in,
+        ])
+        .status()
+        .ok()?;
+    if !st.success() {
+        warn!("osmium extract failed; skipping prefilter.");
+        return None;
+    }
+
+    // Filter to relevant tags (kept minimal, extend as needed)
+    let filter = "nwr/building nwr/highway nwr/landuse=forest,grass,meadow,reservoir nwr/leisure=park,pitch nwr/natural=water nwr/waterway=riverbank nwr/railway nwr/amenity=parking";
+    let st2 = Command::new("osmium")
+        .args([
+            "tags-filter",
+            "--overwrite",
+            "-o",
+            &tmp_filtered,
+            &tmp_extract,
+        ])
+        .args(filter.split_whitespace())
+        .status()
+        .ok()?;
+    if !st2.success() {
+        warn!("osmium tags-filter failed; using bbox extract only.");
+        return Some(tmp_extract);
+    }
+    Some(tmp_filtered)
+}
+
+// ---- Rasterization into SMC1 (decode space) ----
 
 /// Rasterization storage used locally to build SMC1.
 struct SemMask {
-    w: u16, h: u16,
+    w: u16,
+    h: u16,
     data: Vec<u8>, // row-major, 1 byte per pixel
 }
 
-// decode-space transforms and rasterizers identical to your original
-// (lonlat_to_decode_xy, decode_xy_to_pixel, rasterize_polygon, rasterize_polyline, etc.)
-// Keep them verbatim from your provided file.
+#[inline]
+fn lonlat_to_decode_xy(
+    lon: f64,
+    lat: f64,
+    tile_bbox: GeoBboxDeg,
+    decode_min: [f32; 3],
+    decode_max: [f32; 3],
+) -> (f32, f32) {
+    let norm_x = ((lon - tile_bbox.lon_min) / (tile_bbox.lon_max - tile_bbox.lon_min)) as f32;
+    let norm_y = ((lat - tile_bbox.lat_min) / (tile_bbox.lat_max - tile_bbox.lat_min)) as f32;
+    let dx = decode_min[0] + norm_x * (decode_max[0] - decode_min[0]);
+    let dy = decode_min[1] + norm_y * (decode_max[1] - decode_min[1]);
+    (dx, dy)
+}
+
+#[inline]
+fn decode_xy_to_pixel(
+    dx: f32,
+    dy: f32,
+    decode_min: [f32; 3],
+    decode_max: [f32; 3],
+    w: u16,
+    h: u16,
+) -> (i32, i32) {
+    let norm_x = (dx - decode_min[0]) / (decode_max[0] - decode_min[0]);
+    let norm_y = (dy - decode_min[1]) / (decode_max[1] - decode_min[1]);
+    let ix = (norm_x * (w as f32)).round() as i32;
+    let iy = ((1.0 - norm_y) * (h as f32)).round() as i32;
+    (ix, iy)
+}
+
+#[inline]
+fn clamp_i(v: i32, lo: i32, hi: i32) -> i32 {
+    v.max(lo).min(hi)
+}
+
+#[inline]
+fn sqr(x: f32) -> f32 {
+    x * x
+}
+
+fn paint_pixel(mask: &mut SemMask, x: i32, y: i32, class: u8) {
+    // Discard coordinates that lie outside the mask bounds.
+    if x < 0 || y < 0 || x >= mask.w as i32 || y >= mask.h as i32 {
+        return;
+    }
+
+    // Linear index into the mask's class buffer.
+    let idx = (y as usize) * (mask.w as usize) + (x as usize);
+    let previous_class = mask.data[idx];
+
+    // Overwrite only if the new class has equal or higher precedence.
+    if class_precedence(class) >= class_precedence(previous_class) {
+        mask.data[idx] = class;
+    }
+}
+
+fn rasterize_polygon(mask: &mut SemMask, poly: &[(i32, i32)], class: u8) {
+    if poly.len() < 3 {
+        return;
+    }
+    // bounding box
+    let (mut xmin, mut ymin, mut xmax, mut ymax) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for &(x, y) in poly {
+        xmin = xmin.min(x);
+        xmax = xmax.max(x);
+        ymin = ymin.min(y);
+        ymax = ymax.max(y);
+    }
+    xmin = clamp_i(xmin, 0, mask.w as i32 - 1);
+    xmax = clamp_i(xmax, 0, mask.w as i32 - 1);
+    ymin = clamp_i(ymin, 0, mask.h as i32 - 1);
+    ymax = clamp_i(ymax, 0, mask.h as i32 - 1);
+
+    // Even-odd fill by point-in-polygon test per pixel center
+    for y in ymin..=ymax {
+        for x in xmin..=xmax {
+            let mut c = false;
+            let mut j = poly.len() - 1;
+            for i in 0..poly.len() {
+                let (xi, yi) = poly[i];
+                let (xj, yj) = poly[j];
+                let yi_cmp = (yi > y) != (yj > y);
+                if yi_cmp {
+                    let x_inter = (xj - xi) as f32
+                        * ((y - yi) as f32 / ((yj - yi) as f32 + 1e-20))
+                        + xi as f32;
+                    if (x as f32) < x_inter {
+                        c = !c;
+                    }
+                }
+                j = i;
+            }
+            if c {
+                paint_pixel(mask, x, y, class);
+            }
+        }
+    }
+}
+
+/// Rasterizes a polyline (road, path, etc.) onto a semantic mask.
+///
+/// * `mask` – The mutable semantic mask that will receive the rasterised pixels.
+/// * `line` – A slice of pixel coordinates `(i32, i32)` representing the polyline
+///   in image space (already transformed from geographic coordinates). The slice
+///   must contain at least two vertices; otherwise the function returns early.
+/// * `radius_px` – Desired half‑width of the line in **pixel** units. The function
+///   clamps this value to a minimum of `0.5` px to guarantee that a line is at
+///   least one pixel wide and to avoid division‑by‑zero issues.
+/// * `class` – The semantic class identifier (e.g. `SemClass::RoadMajor as u8`).
+///   Pixels are painted using `paint_pixel`, which respects class precedence.
+///
+/// The algorithm walks each consecutive pair of vertices (`seg`) and draws a
+/// thick line segment with radius `r`. For each segment it computes an axis‑aligned
+/// bounding box expanded by the radius, clamps the box to the mask extents, and
+/// then iterates over every pixel in that box. For each pixel the shortest
+/// distance to the line segment is calculated; if the distance is within the
+/// radius the pixel is painted with the supplied `class`.
+///
+fn rasterize_polyline(mask: &mut SemMask, line: &[(i32, i32)], radius_px: f32, class: u8) {
+    // Need at least two points to form a line segment.
+    if line.len() < 2 {
+        return;
+    }
+
+    // Clamp radius to a sensible minimum and pre‑compute its square for distance tests.
+    let r = radius_px.max(0.5);
+    let r2 = r * r;
+
+    // Process each consecutive pair of vertices as a line segment.
+    for seg in line.windows(2) {
+        // Segment endpoints as floating‑point coordinates (pixel centre is at +0.5).
+        let (x0, y0) = (seg[0].0 as f32, seg[0].1 as f32);
+        let (x1, y1) = (seg[1].0 as f32, seg[1].1 as f32);
+
+        // Compute an axis‑aligned bounding box expanded by the radius.
+        let (minx, maxx) = (
+            (x0.min(x1) - r).floor() as i32,
+            (x0.max(x1) + r).ceil() as i32,
+        );
+        let (miny, maxy) = (
+            (y0.min(y1) - r).floor() as i32,
+            (y0.max(y1) + r).ceil() as i32,
+        );
+
+        // Clamp the bounding box to the mask dimensions.
+        let (minx, maxx) = (
+            clamp_i(minx, 0, mask.w as i32 - 1),
+            clamp_i(maxx, 0, mask.w as i32 - 1),
+        );
+        let (miny, maxy) = (
+            clamp_i(miny, 0, mask.h as i32 - 1),
+            clamp_i(maxy, 0, mask.h as i32 - 1),
+        );
+
+        // Vector of the segment and a small epsilon to avoid division by zero.
+        let vx = x1 - x0;
+        let vy = y1 - y0;
+        let denom = vx * vx + vy * vy + 1e-12;
+
+        // Test every pixel inside the clamped bounding box.
+        for y in miny..=maxy {
+            for x in minx..=maxx {
+                // Pixel centre in floating‑point coordinates.
+                let px = x as f32 + 0.5;
+                let py = y as f32 + 0.5;
+
+                // Project the pixel centre onto the line, clamped to the segment.
+                let t = ((px - x0) * vx + (py - y0) * vy) / denom;
+                let t = t.clamp(0.0, 1.0);
+                let qx = x0 + t * vx;
+                let qy = y0 + t * vy;
+
+                // Squared distance from pixel centre to the nearest point on the segment.
+                let d2 = sqr(px - qx) + sqr(py - qy);
+
+                // Paint the pixel if it lies within the radius.
+                if d2 <= r2 {
+                    paint_pixel(mask, x, y, class);
+                }
+            }
+        }
+    }
+}
 
 fn build_smc1_mask(
     overlay: &SemOverlayPerTile,
@@ -506,14 +1354,21 @@ fn print_semantic_mask_ascii(mask: &SemMask) {
         let row_data = &mask.data[row_start..row_end];
         let line: String = row_data
             .iter()
-            .map(|&class| {
-                match class {
-                    0 => '.', 1 => 'B', 2 => '#', 3 => '+', 4 => '-',
-                    5 => '~', 6 => 'P', 7 => 'W', 8 => 'R', 9 => 'p', _ => '?',
-                }
+            .map(|&class| match class {
+                0 => '.',
+                1 => 'B',
+                2 => '#',
+                3 => '+',
+                4 => '-',
+                5 => '~',
+                6 => 'P',
+                7 => 'W',
+                8 => 'R',
+                9 => 'p',
+                _ => '?',
             })
             .collect();
-        println!("{}", line);
+        info!("{}", line);
     }
 }
 
@@ -547,8 +1402,7 @@ fn process_one_mesh(
         .map(|s| s.to_ascii_lowercase())
     {
         Some(ext) if ext == "zip" => {
-            let file = File::open(path)
-                .with_context(|| format!("open {}", path.display()))?;
+            let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
             let mut archive = match zip::ZipArchive::new(file) {
                 Ok(a) => a,
                 Err(e) => {
@@ -579,8 +1433,7 @@ fn process_one_mesh(
             parse_obj_vertices(&mut obj_file)?
         }
         Some(ext) if ext == "obj" => {
-            let file = File::open(path)
-                .with_context(|| format!("open {}", path.display()))?;
+            let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
             parse_obj_vertices(file)?
         }
         _ => {
@@ -607,7 +1460,8 @@ fn process_one_mesh(
                     prefix,
                     ov.roads.len(),
                     ov.areas.len(),
-                    args.sem_grid, args.sem_grid,
+                    args.sem_grid,
+                    args.sem_grid,
                     if args.smc1_compress { "zlib" } else { "raw" }
                 );
                 let mask = build_smc1_mask(ov, bb, decode_min, decode_max, args.sem_grid);
@@ -615,16 +1469,16 @@ fn process_one_mesh(
 
                 // Build palette identical to reader/writer contract
                 let palette: Vec<(u8, u8)> = vec![
-                    (SemClass::Unknown as u8,   class_precedence(SemClass::Unknown as u8)),
-                    (SemClass::Building as u8,  class_precedence(SemClass::Building as u8)),
+                    (SemClass::Unknown as u8, class_precedence(SemClass::Unknown as u8)),
+                    (SemClass::Building as u8, class_precedence(SemClass::Building as u8)),
                     (SemClass::RoadMajor as u8, class_precedence(SemClass::RoadMajor as u8)),
                     (SemClass::RoadMinor as u8, class_precedence(SemClass::RoadMinor as u8)),
-                    (SemClass::Path as u8,      class_precedence(SemClass::Path as u8)),
-                    (SemClass::Water as u8,     class_precedence(SemClass::Water as u8)),
-                    (SemClass::Park as u8,      class_precedence(SemClass::Park as u8)),
-                    (SemClass::Woodland as u8,  class_precedence(SemClass::Woodland as u8)),
-                    (SemClass::Railway as u8,   class_precedence(SemClass::Railway as u8)),
-                    (SemClass::Parking as u8,   class_precedence(SemClass::Parking as u8)),
+                    (SemClass::Path as u8, class_precedence(SemClass::Path as u8)),
+                    (SemClass::Water as u8, class_precedence(SemClass::Water as u8)),
+                    (SemClass::Park as u8, class_precedence(SemClass::Park as u8)),
+                    (SemClass::Woodland as u8, class_precedence(SemClass::Woodland as u8)),
+                    (SemClass::Railway as u8, class_precedence(SemClass::Railway as u8)),
+                    (SemClass::Parking as u8, class_precedence(SemClass::Parking as u8)),
                 ];
 
                 Some(Smc1 {
@@ -633,15 +1487,25 @@ fn process_one_mesh(
                     data: mask.data,
                     palette,
                     coord_space: 0,
-                    encoding: if args.smc1_compress { Smc1Encoding::Zlib } else { Smc1Encoding::Raw },
+                    encoding: if args.smc1_compress {
+                        Smc1Encoding::Zlib
+                    } else {
+                        Smc1Encoding::Raw
+                    },
                 })
             }
             (Some(_), None) if args.osm_pbf.is_some() => {
-                debug!("SMC1 omitted for '{}' (overlay map has no entry for this prefix)", prefix);
+                debug!(
+                    "SMC1 omitted for '{}' (overlay map has no entry for this prefix)",
+                    prefix
+                );
                 None
             }
             (None, _) if args.osm_pbf.is_some() => {
-                debug!("SMC1 omitted for '{}' (no bbox available from feature index)", prefix);
+                debug!(
+                    "SMC1 omitted for '{}' (no bbox available from feature index)",
+                    prefix
+                );
                 None
             }
             _ => None,
@@ -690,9 +1554,7 @@ fn process_one_mesh(
 
     info!(
         "OK {} → {} ({} pts → {} pts; ~{:.2} MiB)",
-        path.file_name()
-            .unwrap_or_default()
-            .to_string_lossy(),
+        path.file_name().unwrap_or_default().to_string_lossy(),
         out_path.display(),
         positions.len() / 3,
         m,
@@ -716,7 +1578,10 @@ fn main() -> Result<()> {
         info!("Loading feature index: {}", fi);
         let mut items = load_feature_index(fi)?;
         items.retain(|it| resolve_by_prefix(&lidx, &it.prefix, args.prefer_zip).is_some());
-        info!("After pruning to existing meshes: {} work items", items.len());
+        info!(
+            "After pruning to existing meshes: {} work items",
+            items.len()
+        );
         items
     } else {
         lidx.names
@@ -730,22 +1595,33 @@ fn main() -> Result<()> {
 
     // Resolve tiles to files
     #[derive(Clone)]
-    struct Resolved { item: WorkItem, path: PathBuf }
+    struct Resolved {
+        item: WorkItem,
+        path: PathBuf,
+    }
     let mut resolved: Vec<Resolved> = Vec::with_capacity(work.len());
     let mut missing: Vec<String> = Vec::new();
     for w in &work {
         if let Some(p) = resolve_by_prefix(&lidx, &w.prefix, args.prefer_zip) {
-            resolved.push(Resolved { item: w.clone(), path: p });
+            resolved.push(Resolved {
+                item: w.clone(),
+                path: p,
+            });
         } else {
             missing.push(w.prefix.clone());
         }
     }
     info!(
         "Matched {} / {} feature(s) to local files ({} missing).",
-        resolved.len(), work.len(), missing.len()
+        resolved.len(),
+        work.len(),
+        missing.len()
     );
     if !missing.is_empty() {
-        debug!("First 20 missing prefixes: {:?}", &missing.iter().take(20).collect::<Vec<_>>());
+        debug!(
+            "First 20 missing prefixes: {:?}",
+            &missing.iter().take(20).collect::<Vec<_>>()
+        );
     }
 
     // Overlays (optional)
@@ -776,12 +1652,21 @@ fn main() -> Result<()> {
     );
     let overlays_map = overlays_map.clone();
     resolved.par_iter().enumerate().for_each(|(idx, r)| {
-        info!("Processing {}/{}: {}", idx + 1, total_items, r.item.prefix);
+        info!(
+            "Processing {}/{}: {}",
+            idx + 1,
+            total_items,
+            r.item.prefix
+        );
         let ov = overlays_map.as_ref().and_then(|m| m.get(&r.item.prefix));
         if let Err(e) = process_one_mesh(&r.path, &args, &r.item.prefix, r.item.bbox, ov) {
             error!("{}: {e:#}", r.path.display());
         }
     });
-    info!("Finished processing {} items in {:.2?}", total_items, start_time.elapsed());
+    info!(
+        "Finished processing {} items in {:.2?}",
+        total_items,
+        start_time.elapsed()
+    );
     Ok(())
 }
