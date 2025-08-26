@@ -324,7 +324,7 @@ impl App {
     }
 
     pub fn build_all_tiles(&mut self, root: &str) -> Result<()> {
-        use crate::data::{GeoExtentDeg, QuantizedPointCloud};
+        use crate::data::{GeoExtentDeg, QuantizedPointCloud, point_cloud};
         use crate::renderer::pipelines::hologram::{Instance, TileUniforms};
 
         let paths = Self::scan_hypc_files(root);
@@ -384,6 +384,64 @@ impl App {
         self.mdeg_lat_ref = point_cloud::meters_per_deg_lat(self.lat0);
         self.geot_union = Some(geot_union.clone());
 
+        // Since obj2hypc centers each tile's decode space at origin,
+        // we need to track the actual Z centers and ranges
+        // The decode space is [-extent/2, extent/2] for each axis
+        let mut z_centers = Vec::new();
+        let mut z_ranges = Vec::new();
+        for l in &loaded {
+            let z_center = 0.5 * (l.pc.decode_min.z + l.pc.decode_max.z);
+            let z_range = l.pc.decode_max.z - l.pc.decode_min.z;
+            z_centers.push(z_center);
+            z_ranges.push(z_range);
+            log::info!("Tile {}: Z center={}, Z range={}", l.name, z_center, z_range);
+        }
+        
+        // Use the average Z center as our global reference
+        let z_center_global = if !z_centers.is_empty() {
+            z_centers.iter().sum::<f32>() / z_centers.len() as f32
+        } else {
+            0.0
+        };
+        
+        // Compute a global meters-per-decode scale using median of all tile scales
+        let mut all_scales = Vec::new();
+        for l in &loaded {
+            let geot = l.pc.geog_bbox_deg.as_ref().unwrap();
+            let decode_min = l.pc.decode_min;
+            let decode_max = l.pc.decode_max;
+            
+            let lat_c = 0.5 * (geot.lat_min + geot.lat_max);
+            let m_per_deg_lon = point_cloud::meters_per_deg_lon(lat_c);
+            let m_per_deg_lat = point_cloud::meters_per_deg_lat(lat_c);
+            
+            let dx_dec = (decode_max.x - decode_min.x).abs().max(f32::EPSILON);
+            let dy_dec = (decode_max.y - decode_min.y).abs().max(f32::EPSILON);
+            let lon_span = (geot.lon_max - geot.lon_min).max(f64::EPSILON);
+            let lat_span = (geot.lat_max - geot.lat_min).max(f64::EPSILON);
+            
+            let sx = (m_per_deg_lon as f32) * (lon_span as f32) / dx_dec;
+            let sy = (m_per_deg_lat as f32) * (lat_span as f32) / dy_dec;
+            let scale = 0.5 * (sx + sy);
+            all_scales.push(scale);
+        }
+        
+        // Use median scale for better robustness
+        all_scales.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let m_per_decode_global = if all_scales.len() % 2 == 0 {
+            let mid = all_scales.len() / 2;
+            0.5 * (all_scales[mid - 1] + all_scales[mid])
+        } else {
+            all_scales[all_scales.len() / 2]
+        };
+        
+        log::info!("Global Z center: {}", z_center_global);
+        log::info!("Global m_per_decode scale: {} (from {} tiles)", m_per_decode_global, all_scales.len());
+        for (i, l) in loaded.iter().enumerate() {
+            log::info!("Tile {}: decode_min.z = {}, decode_max.z = {}, tile_scale = {}", 
+                i, l.pc.decode_min.z, l.pc.decode_max.z, all_scales[i]);
+        }
+
         let mut tiles = Vec::<TileDraw>::new();
         let mut world_min = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
         let mut world_max = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
@@ -393,20 +451,30 @@ impl App {
             let geot = pc.geog_bbox_deg.clone().unwrap();
             let (decode_min, decode_max) = (pc.decode_min, pc.decode_max);
 
-            let lon_span_union = (geot_union.lon_max - geot_union.lon_min) as f32;
-            let lat_span_union = (geot_union.lat_max - geot_union.lat_min) as f32;
-            let decode_span_x = (decode_max.x - decode_min.x).abs();
-            let decode_span_y = (decode_max.y - decode_min.y).abs();
-
-            let sz_ref = (self.mdeg_lon_ref as f32 * lon_span_union
-                + self.mdeg_lat_ref as f32 * lat_span_union)
-                / (decode_span_x + decode_span_y).max(1e-6)
-                * 0.5;
-
-            let dx = (decode_max.x - decode_min.x).max(f32::EPSILON);
-            let dy = (decode_max.y - decode_min.y).max(f32::EPSILON);
+            // Per-tile scale to convert decode units -> meters, derived from this tile's GEOT bbox
+            let lat_c = 0.5 * (geot.lat_min + geot.lat_max);
+            let m_per_deg_lon = point_cloud::meters_per_deg_lon(lat_c);
+            let m_per_deg_lat = point_cloud::meters_per_deg_lat(lat_c);
+            
+            let dx_dec = (decode_max.x - decode_min.x).abs().max(f32::EPSILON);
+            let dy_dec = (decode_max.y - decode_min.y).abs().max(f32::EPSILON);
             let lon_span = (geot.lon_max - geot.lon_min).max(f64::EPSILON);
             let lat_span = (geot.lat_max - geot.lat_min).max(f64::EPSILON);
+            
+            // meters per decode unit along each axis (affine assumption already made for XY)
+            let sx = (m_per_deg_lon as f32) * (lon_span as f32) / dx_dec;
+            let sy = (m_per_deg_lat as f32) * (lat_span as f32) / dy_dec;
+            
+            // If producer was isotropic in decode space (usual), use the mean:
+            let m_per_decode = 0.5 * (sx + sy);
+            
+            log::info!("Tile {}: sx={}, sy={}, m_per_decode={}, dx_dec={}, dy_dec={}", 
+                l.name, sx, sy, m_per_decode, dx_dec, dy_dec);
+            log::info!("  decode Z range: {} to {}, using global scale: {}", 
+                decode_min.z, decode_max.z, m_per_decode_global);
+            
+            let dx = dx_dec;
+            let dy = dy_dec;
 
             let instance_positions: Vec<[f32; 3]> = pc
                 .positions
@@ -416,7 +484,8 @@ impl App {
                     let lat = geot.lat_min + ((p.y - decode_min.y) as f64 / dy as f64) * lat_span;
                     let x_world = ((lon - self.lon0) * self.mdeg_lon_ref) as f32;
                     let y_world = ((lat - self.lat0) * self.mdeg_lat_ref) as f32;
-                    let z_world = (p.z - decode_min.z) * sz_ref;
+                    // Use GLOBAL scale and GLOBAL Z baseline for consistent Z across all tiles
+                    let z_world = (p.z - z_center_global) * m_per_decode_global;
 
                     world_min = world_min.min(Vec3::new(x_world, y_world, z_world));
                     world_max = world_max.max(Vec3::new(x_world, y_world, z_world));
@@ -428,13 +497,13 @@ impl App {
             let dmin_world = Vec3::new(
                 ((geot.lon_min - self.lon0) * self.mdeg_lon_ref) as f32,
                 ((geot.lat_min - self.lat0) * self.mdeg_lat_ref) as f32,
-                0.0,
+                (decode_min.z - z_center_global) * m_per_decode_global,
             );
 
             let dmax_world = Vec3::new(
                 ((geot.lon_max - self.lon0) * self.mdeg_lon_ref) as f32,
                 ((geot.lat_max - self.lat0) * self.mdeg_lat_ref) as f32,
-                (decode_max.z - decode_min.z) * sz_ref,
+                (decode_max.z - z_center_global) * m_per_decode_global,
             );
 
             let edge_samples =
@@ -541,10 +610,11 @@ impl App {
         let mut world_max_biased = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
 
         for tile in &tiles {
-            world_min_biased = world_min_biased.min(tile.dmin_world);
-            world_max_biased = world_max_biased.max(tile.dmax_world);
-            world_min_biased.z = world_min_biased.z.min(tile.dmin_world.z + tile.z_bias);
-            world_max_biased.z = world_max_biased.z.max(tile.dmax_world.z + tile.z_bias);
+            // Include XY biases in world bounds calculation for consistent post-processing
+            let min_with_bias = tile.dmin_world + Vec3::new(tile.xy_bias.x, tile.xy_bias.y, tile.z_bias);
+            let max_with_bias = tile.dmax_world + Vec3::new(tile.xy_bias.x, tile.xy_bias.y, tile.z_bias);
+            world_min_biased = world_min_biased.min(min_with_bias);
+            world_max_biased = world_max_biased.max(max_with_bias);
         }
 
         self.tiles = tiles;
