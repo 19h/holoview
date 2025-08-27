@@ -47,6 +47,7 @@ pub struct GeoExtentQ7 {
     pub lat_min_q7: i32,
     pub lat_max_q7: i32,
 }
+
 impl GeoExtentQ7 {
     #[inline]
     pub fn from_deg(lon_min: f64, lon_max: f64, lat_min: f64, lat_max: f64) -> Self {
@@ -57,6 +58,7 @@ impl GeoExtentQ7 {
             lat_max_q7: (lat_max * 1e7).round() as i32,
         }
     }
+
     #[inline]
     pub fn to_deg(self) -> (f64, f64, f64, f64) {
         (
@@ -107,11 +109,13 @@ pub struct HypcTile {
 
 pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<HypcTile> {
     let mut f = File::open(path)?;
+
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
     if magic != HYPC_MAGIC {
         return Err(io::Error::new(ErrorKind::InvalidData, "bad HYPC magic"));
     }
+
     let version = read_u32(&mut f)?;
     if version != HYPC_VERSION {
         return Err(io::Error::new(
@@ -119,6 +123,7 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<HypcTile> {
             format!("unsupported HYPC version {}", version),
         ));
     }
+
     let flags = read_u32(&mut f)?;
     let has_key = (flags & (1 << 0)) != 0;
     let has_labels = (flags & (1 << 1)) != 0;
@@ -133,7 +138,13 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<HypcTile> {
             "units_per_meter must be > 0",
         ));
     }
-    let anchor_ecef_units = [read_i64(&mut f)?, read_i64(&mut f)?, read_i64(&mut f)?];
+
+    let anchor_ecef_units = [
+        read_i64(&mut f)?,
+        read_i64(&mut f)?,
+        read_i64(&mut f)?,
+    ];
+
     let tile_key = if has_key {
         let mut k = [0u8; 32];
         f.read_exact(&mut k)?;
@@ -154,6 +165,7 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<HypcTile> {
         let dy = read_i32(&mut f)?;
         let dz = read_i32(&mut f)?;
         points_units.push([dx, dy, dz]);
+
         if let Some(ref mut ls) = labels {
             let mut b = [0u8; 1];
             f.read_exact(&mut b)?;
@@ -167,10 +179,12 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<HypcTile> {
         if &tag != b"GEOT" {
             return Err(io::Error::new(ErrorKind::InvalidData, "expected GEOT tag"));
         }
+
         let lon_min_q7 = read_i32(&mut f)?;
         let lon_max_q7 = read_i32(&mut f)?;
         let lat_min_q7 = read_i32(&mut f)?;
         let lat_max_q7 = read_i32(&mut f)?;
+
         Some(GeoExtentQ7 {
             lon_min_q7,
             lon_max_q7,
@@ -187,8 +201,10 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<HypcTile> {
         if &tag != b"SMC1" {
             return Err(io::Error::new(ErrorKind::InvalidData, "expected SMC1 tag"));
         }
-        let w = read_u16(&mut f)?;
-        let h = read_u16(&mut f)?;
+
+        let width = read_u16(&mut f)?;
+        let height = read_u16(&mut f)?;
+
         let coord_space = match read_u8(&mut f)? {
             0 => Smc1CoordSpace::DecodeXY,
             1 => Smc1CoordSpace::Crs84BboxNorm,
@@ -196,9 +212,10 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<HypcTile> {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
                     format!("unknown SMC1 coord space {}", x),
-                ))
+                ));
             }
         };
+
         let encoding = match read_u8(&mut f)? {
             0 => Smc1Encoding::Raw,
             1 => Smc1Encoding::Rle,
@@ -206,22 +223,25 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<HypcTile> {
                 return Err(io::Error::new(
                     ErrorKind::InvalidData,
                     format!("unknown SMC1 encoding {}", x),
-                ))
+                ));
             }
         };
-        let pal_len = read_u16(&mut f)? as usize;
-        let mut palette = Vec::<(u8, u8)>::with_capacity(pal_len);
-        for _ in 0..pal_len {
+
+        let palette_len = read_u16(&mut f)? as usize;
+        let mut palette = Vec::<(u8, u8)>::with_capacity(palette_len);
+        for _ in 0..palette_len {
             let class = read_u8(&mut f)?;
-            let prec = read_u8(&mut f)?;
-            palette.push((class, prec));
+            let precedence = read_u8(&mut f)?;
+            palette.push((class, precedence));
         }
+
         let payload_size = read_u32(&mut f)? as usize;
         let mut data = vec![0u8; payload_size];
         f.read_exact(&mut data)?;
+
         Some(Smc1Chunk {
-            width: w,
-            height: h,
+            width,
+            height,
             coord_space,
             encoding,
             palette,
@@ -244,31 +264,39 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<HypcTile> {
 
 pub fn write_file<P: AsRef<Path>>(path: P, tile: &HypcTile) -> io::Result<()> {
     let mut flags = 0u32;
+
     if tile.tile_key.is_some() {
         flags |= 1 << 0;
     }
+
     if tile.labels.is_some() {
         flags |= 1 << 1;
     }
+
     if tile.geot.is_some() {
         flags |= 1 << 2;
     }
+
     if tile.smc1.is_some() {
         flags |= 1 << 3;
     }
 
     let mut f = File::create(path)?;
+
     f.write_all(&HYPC_MAGIC)?;
+
     write_u32(&mut f, HYPC_VERSION)?;
     write_u32(&mut f, flags)?;
+
     write_u32(&mut f, tile.points_units.len() as u32)?;
     write_u32(&mut f, tile.units_per_meter)?;
+
     write_i64(&mut f, tile.anchor_ecef_units[0])?;
     write_i64(&mut f, tile.anchor_ecef_units[1])?;
     write_i64(&mut f, tile.anchor_ecef_units[2])?;
 
-    if let Some(k) = tile.tile_key {
-        f.write_all(&k)?;
+    if let Some(key) = tile.tile_key {
+        f.write_all(&key)?;
     }
 
     if let Some(labels) = tile.labels.as_ref() {
@@ -278,25 +306,25 @@ pub fn write_file<P: AsRef<Path>>(path: P, tile: &HypcTile) -> io::Result<()> {
                 "labels length != points length",
             ));
         }
-    }
 
-    if let Some(labels) = tile.labels.as_ref() {
-        for (i, p) in tile.points_units.iter().enumerate() {
-            write_i32(&mut f, p[0])?;
-            write_i32(&mut f, p[1])?;
-            write_i32(&mut f, p[2])?;
+        for (i, point) in tile.points_units.iter().enumerate() {
+            write_i32(&mut f, point[0])?;
+            write_i32(&mut f, point[1])?;
+            write_i32(&mut f, point[2])?;
+
             f.write_all(&[labels[i]])?;
         }
     } else {
-        for p in tile.points_units.iter() {
-            write_i32(&mut f, p[0])?;
-            write_i32(&mut f, p[1])?;
-            write_i32(&mut f, p[2])?;
+        for point in tile.points_units.iter() {
+            write_i32(&mut f, point[0])?;
+            write_i32(&mut f, point[1])?;
+            write_i32(&mut f, point[2])?;
         }
     }
 
     if let Some(geot) = tile.geot.as_ref() {
         f.write_all(b"GEOT")?;
+
         write_i32(&mut f, geot.lon_min_q7)?;
         write_i32(&mut f, geot.lon_max_q7)?;
         write_i32(&mut f, geot.lat_min_q7)?;
@@ -305,19 +333,26 @@ pub fn write_file<P: AsRef<Path>>(path: P, tile: &HypcTile) -> io::Result<()> {
 
     if let Some(smc1) = tile.smc1.as_ref() {
         f.write_all(b"SMC1")?;
+
         write_u16(&mut f, smc1.width)?;
         write_u16(&mut f, smc1.height)?;
+
         f.write_all(&[smc1.coord_space as u8])?;
         f.write_all(&[smc1.encoding as u8])?;
+
         write_u16(&mut f, smc1.palette.len() as u16)?;
-        for (c, pr) in &smc1.palette {
-            f.write_all(&[*c, *pr])?;
+
+        for &(class, precedence) in &smc1.palette {
+            f.write_all(&[class, precedence])?;
         }
+
         write_u32(&mut f, smc1.data.len() as u32)?;
+
         f.write_all(&smc1.data)?;
     }
 
     f.flush()?;
+
     Ok(())
 }
 
@@ -326,43 +361,62 @@ pub fn smc1_encode_rle(raw: &[u8]) -> Vec<u8> {
     if raw.is_empty() {
         return out;
     }
+
     let mut i = 0usize;
     while i < raw.len() {
-        let v = raw[i];
-        let mut run = 1usize;
-        while i + run < raw.len() && raw[i + run] == v && run < u16::MAX as usize {
-            run += 1;
+        let value = raw[i];
+        let mut run_length = 1usize;
+
+        while i + run_length < raw.len()
+            && raw[i + run_length] == value
+            && run_length < u16::MAX as usize
+        {
+            run_length += 1;
         }
-        out.extend_from_slice(&(run as u16).to_le_bytes());
-        out.push(v);
-        i += run;
+
+        out.extend_from_slice(&(run_length as u16).to_le_bytes());
+        out.push(value);
+        i += run_length;
     }
+
     out
 }
 
 pub fn smc1_decode_rle(rle: &[u8]) -> io::Result<Vec<u8>> {
     let mut out = Vec::<u8>::new();
     let mut i = 0usize;
+
     while i + 3 <= rle.len() {
         let run = u16::from_le_bytes([rle[i], rle[i + 1]]) as usize;
         let v = rle[i + 2];
         out.resize(out.len() + run, v);
         i += 3;
     }
+
     if i != rle.len() {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             "RLE payload truncated",
         ));
     }
+
     Ok(out)
 }
 
 pub mod wgs84 {
-    pub const A: f64 = 6378137.0;
+    /// Semi-major axis (equatorial radius) in meters.
+    pub const A: f64 = 6_378_137.0;
+
+    /// Flattening factor (1 / 298.257223563).
     pub const F: f64 = 1.0 / 298.257_223_563;
+
+    /// First eccentricity squared.
     pub const E2: f64 = F * (2.0 - F);
+
+    /// Semi-minor axis (polar radius) in meters.
     pub const B: f64 = A * (1.0 - F);
+
+    /// Second eccentricity squared.
     pub const E2P: f64 = (A * A - B * B) / (B * B);
 }
 
@@ -382,6 +436,7 @@ pub fn geodetic_to_ecef(lat_deg: f64, lon_deg: f64, h_m: f64) -> [f64; 3] {
 #[inline]
 pub fn ecef_to_geodetic(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
     use wgs84::*;
+
     let p = (x * x + y * y).sqrt();
     let lon = y.atan2(x);
     let theta = (z * A).atan2(p * B);
@@ -390,6 +445,7 @@ pub fn ecef_to_geodetic(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
     let sin_lat = lat.sin();
     let n = A / (1.0 - E2 * sin_lat * sin_lat).sqrt();
     let h = p / lat.cos() - n;
+
     (lat.to_degrees(), lon.to_degrees(), h)
 }
 
@@ -411,24 +467,28 @@ fn read_u8<R: Read>(r: &mut R) -> io::Result<u8> {
     r.read_exact(&mut b)?;
     Ok(b[0])
 }
+
 #[inline]
 fn read_u16<R: Read>(r: &mut R) -> io::Result<u16> {
     let mut b = [0u8; 2];
     r.read_exact(&mut b)?;
     Ok(u16::from_le_bytes(b))
 }
+
 #[inline]
 fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
     Ok(u32::from_le_bytes(b))
 }
+
 #[inline]
 fn read_i32<R: Read>(r: &mut R) -> io::Result<i32> {
     let mut b = [0u8; 4];
     r.read_exact(&mut b)?;
     Ok(i32::from_le_bytes(b))
 }
+
 #[inline]
 fn read_i64<R: Read>(r: &mut R) -> io::Result<i64> {
     let mut b = [0u8; 8];
@@ -440,14 +500,17 @@ fn read_i64<R: Read>(r: &mut R) -> io::Result<i64> {
 fn write_u16<W: Write>(w: &mut W, v: u16) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
 }
+
 #[inline]
 fn write_u32<W: Write>(w: &mut W, v: u32) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
 }
+
 #[inline]
 fn write_i32<W: Write>(w: &mut W, v: i32) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
 }
+
 #[inline]
 fn write_i64<W: Write>(w: &mut W, v: i64) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
