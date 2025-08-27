@@ -14,6 +14,7 @@ impl HologramPipeline {
         depth_fmt: wgpu::TextureFormat,
         dlin_fmt: wgpu::TextureFormat,
     ) -> Self {
+        // Uniform buffer layout for tile data
         let tile_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("HYPC Tile UBO Layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -23,53 +24,63 @@ impl HologramPipeline {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
                     min_binding_size: wgpu::BufferSize::new(
-                        std::mem::size_of::<TileUniform>() as u64
+                        std::mem::size_of::<TileUniform>() as u64,
                     ),
                 },
                 count: None,
             }],
         });
 
+        // Vertex/fragment shader
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shaders/hypc_points.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../../shaders/hypc_points.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../../shaders/hypc_points.wgsl").into(),
+            ),
         });
 
+        // Full‑screen quad vertices
         let quad_corners: [[f32; 2]; 6] = [
-            [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0],
-            [-1.0, -1.0], [1.0, 1.0], [-1.0, 1.0],
+            [-1.0, -1.0],
+            [1.0, -1.0],
+            [1.0, 1.0],
+            [-1.0, -1.0],
+            [1.0, 1.0],
+            [-1.0, 1.0],
         ];
+
         let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Hologram Quad VB"),
             contents: bytemuck::cast_slice(&quad_corners),
             usage: wgpu::BufferUsages::VERTEX,
         });
 
+        // Vertex buffer layouts: quad + per‑instance data
         let vbuf_layouts = [
-            // Quad corner buffer
+            // Quad vertices
             wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<[f32; 2]>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[wgpu::VertexAttribute {
-                    shader_location: 0, // Corresponds to @location(0) in WGSL
+                    shader_location: 0,
                     offset: 0,
                     format: wgpu::VertexFormat::Float32x2,
                 }],
             },
-            // Per-instance data buffer
+            // Instance attributes
             wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<PointInstance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[
-                    // ofs_m
+                    // Position offset (vec3)
                     wgpu::VertexAttribute {
-                        shader_location: 1, // Corresponds to @location(1) in WGSL
+                        shader_location: 1,
                         offset: 0,
                         format: wgpu::VertexFormat::Float32x3,
                     },
-                    // label
+                    // Label (uint)
                     wgpu::VertexAttribute {
-                        shader_location: 2, // Corresponds to @location(2) in WGSL
+                        shader_location: 2,
                         offset: 12,
                         format: wgpu::VertexFormat::Uint32,
                     },
@@ -77,12 +88,14 @@ impl HologramPipeline {
             },
         ];
 
+        // Pipeline layout with tile uniform bind group
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("HYPC Hologram PipelineLayout"),
             bind_group_layouts: &[&tile_layout],
             push_constant_ranges: &[],
         });
 
+        // Render pipeline definition
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("HYPC Hologram Pipeline"),
             layout: Some(&pipeline_layout),
@@ -109,7 +122,6 @@ impl HologramPipeline {
                 targets: &[
                     Some(wgpu::ColorTargetState {
                         format: color_fmt,
-                        //blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -132,7 +144,11 @@ impl HologramPipeline {
         }
     }
 
-    pub fn draw_tile<'a>(&'a self, rpass: &mut wgpu::RenderPass<'a>, tile: &'a crate::data::types::TileGpu) {
+    pub fn draw_tile<'a>(
+        &'a self,
+        rpass: &mut wgpu::RenderPass<'a>,
+        tile: &'a crate::data::types::TileGpu,
+    ) {
         rpass.set_pipeline(&self.pipeline);
         rpass.set_bind_group(0, &tile.bind, &[]);
         rpass.set_vertex_buffer(0, self.quad_vb.slice(..));

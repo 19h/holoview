@@ -1,8 +1,10 @@
-//! Executable entry point for the Holographic Viewer application.
+//! Entry point for the Holographic Viewer application.
 
 use anyhow::Result;
 use holographic_viewer::app::App;
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -11,12 +13,12 @@ use winit::{
 };
 
 fn main() -> Result<()> {
-    // Setup logging with a sensible default if RUST_LOG is unset
+    // Initialize logging; default to "info" if RUST_LOG is unset.
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info")
     ).init();
 
-    // Create the winit event loop and window
+    // Create the event loop and window.
     let event_loop = EventLoop::new()?;
     let window = Arc::new(
         WindowBuilder::new()
@@ -25,24 +27,21 @@ fn main() -> Result<()> {
             .build(&event_loop)?,
     );
 
-    // Block on async initialization
+    // Initialise the application (async → sync).
     let mut app = pollster::block_on(App::new(window.clone()))?;
 
-    // Load data
-    if let Err(e) = app.build_all_tiles("hypc") {
-        log::error!("Failed to build tiles: {}", e);
+    // Load tiles; log any errors.
+    if let Err(err) = app.build_all_tiles("hypc") {
+        log::error!("Failed to build tiles: {}", err);
     }
 
-    // Run the event loop
+    // Run the winit event loop.
     event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::Poll);
 
         match event {
-            Event::WindowEvent {
-                window_id,
-                event,
-            } if window_id == window.id() => {
-                // Pass events to the app. If not consumed, handle window-level events.
+            Event::WindowEvent { window_id, event } if window_id == window.id() => {
+                // Forward events to the app; handle unconsumed window events.
                 if !app.handle_event(&window, &event) {
                     match event {
                         WindowEvent::CloseRequested => elwt.exit(),
@@ -54,9 +53,11 @@ fn main() -> Result<()> {
                         WindowEvent::RedrawRequested => {
                             match app.render(&window) {
                                 Ok(_) => {}
-                                Err(wgpu::SurfaceError::Lost) => app.resize(app.renderer.gfx.size),
+                                Err(wgpu::SurfaceError::Lost) => {
+                                    app.resize(app.renderer.gfx.size);
+                                }
                                 Err(wgpu::SurfaceError::OutOfMemory) => {
-                                    log::error!("WGPU Out of Memory! Exiting.");
+                                    log::error!("WGPU out of memory – exiting.");
                                     elwt.exit();
                                 }
                                 Err(e) => log::error!("Render error: {:?}", e),
@@ -67,7 +68,7 @@ fn main() -> Result<()> {
                 }
             }
             Event::AboutToWait => {
-                // Redraw continuously
+                // Request a redraw each frame.
                 window.request_redraw();
             }
             _ => {}

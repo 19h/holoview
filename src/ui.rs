@@ -4,18 +4,18 @@ use egui::{Area, Frame, RichText};
 
 /// Draws the HUD overlay, including corner brackets and status text.
 pub fn draw_hud(egui_ctx: &egui::Context, altitude: i32, total_points: u32) {
-    // Corner brackets & dot painter
+    // Draw corner brackets and central dot
     {
         let painter = egui_ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("hud_lines"),
         ));
 
-        let rect = egui_ctx.screen_rect();
-        let color = egui::Color32::from_rgba_unmultiplied(45, 247, 255, 200);
+        let rect   = egui_ctx.screen_rect();
+        let color  = egui::Color32::from_rgba_unmultiplied(45, 247, 255, 200);
         let (thickness, margin, length) = (2.0, 26.0, 140.0);
 
-        // Top-left bracket
+        // Top‑left bracket
         painter.line_segment(
             [egui::pos2(margin, margin), egui::pos2(margin + length, margin)],
             (thickness, color),
@@ -25,7 +25,7 @@ pub fn draw_hud(egui_ctx: &egui::Context, altitude: i32, total_points: u32) {
             (thickness, color),
         );
 
-        // Top-right bracket
+        // Top‑right bracket
         painter.line_segment(
             [
                 egui::pos2(rect.max.x - margin - length, margin),
@@ -41,7 +41,7 @@ pub fn draw_hud(egui_ctx: &egui::Context, altitude: i32, total_points: u32) {
             (thickness, color),
         );
 
-        // Bottom-left bracket
+        // Bottom‑left bracket
         painter.line_segment(
             [
                 egui::pos2(margin, rect.max.y - margin),
@@ -57,7 +57,7 @@ pub fn draw_hud(egui_ctx: &egui::Context, altitude: i32, total_points: u32) {
             (thickness, color),
         );
 
-        // Bottom-right bracket
+        // Bottom‑right bracket
         painter.line_segment(
             [
                 egui::pos2(rect.max.x - margin - length, rect.max.y - margin),
@@ -73,11 +73,11 @@ pub fn draw_hud(egui_ctx: &egui::Context, altitude: i32, total_points: u32) {
             (thickness, color),
         );
 
-        // Top-center dot
+        // Central dot
         painter.circle_filled(egui::pos2(rect.center().x, 16.0), 3.0, color);
     }
 
-    // Top-left status text
+    // Draw status text in the top‑left corner
     {
         Area::new("hud_text".into())
             .interactable(false)

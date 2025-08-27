@@ -25,16 +25,16 @@ impl App {
         let renderer = Renderer::new(window.clone()).await?;
         let size = renderer.gfx.size;
 
-        // Use DX/Vulkan-style 0..1 depth (wgpu default).
+        // WebGPU/wgpu uses 0..1 depth; glam::Mat4::perspective_rh is RH, depth in [0,1].
         let proj = Mat4::perspective_rh(
             60f32.to_radians(),
             size.width as f32 / size.height.max(1) as f32,
-            10.0, // Near plane
-            20_000_000.0, // Far plane (large enough for ECEF)
+            10.0,
+            20_000_000.0,
         );
 
         // Default camera position (e.g., over San Francisco)
-        let camera = Camera::new(37.77, -122.41, 5000.0, proj);
+        let camera = Camera::new(52.52, 13.40, 5000.0, proj);
         let camera_controller = CameraController::new();
 
         let egui_ctx = egui::Context::default();
@@ -155,16 +155,35 @@ impl App {
         }
 
         if !loaded_tiles.is_empty() && sum_w > 0.0 {
-            // Weighted centroid in ECEF meters
+            // Weighted centroid in "claimed ECEF" meters
             let center_ecef_m = [
                 sum_anchor_w[0] / sum_w,
                 sum_anchor_w[1] / sum_w,
                 sum_anchor_w[2] / sum_w,
             ];
 
-            let (lat, lon, _h) = hypc::ecef_to_geodetic(center_ecef_m[0], center_ecef_m[1], center_ecef_m[2]);
-            self.camera.lat_deg = lat;
-            self.camera.lon_deg = lon;
+            // Plausibility check for WGS‑84 ECEF surface vicinity
+            let r = (center_ecef_m[0]*center_ecef_m[0]
+                   + center_ecef_m[1]*center_ecef_m[1]
+                   + center_ecef_m[2]*center_ecef_m[2]).sqrt();
+            // Accept only ~6.2–6.5 Mm (allows terrain + a few km)
+            let plausible = (6_200_000.0..=6_500_000.0).contains(&r);
+            let mut lat_opt = None;
+            let mut lon_opt = None;
+            if plausible {
+                let (lat, lon, _h) = hypc::ecef_to_geodetic(
+                    center_ecef_m[0], center_ecef_m[1], center_ecef_m[2]);
+                self.camera.lat_deg = lat;
+                self.camera.lon_deg = lon;
+                lat_opt = Some(lat);
+                lon_opt = Some(lon);
+            } else {
+                log::warn!(
+                    "Anchor centroid radius {:.3} Mm not plausible for WGS‑84; skipping recenter. \
+                     (Check input CS and HYPC anchors.)",
+                    r * 1e-6
+                );
+            }
 
             // Approximate dataset radius from anchor spread
             let mut r2_max = 0.0f64;
@@ -183,12 +202,21 @@ impl App {
                 "Loaded {} tiles | points={} | UPM range [{}..{}].",
                 loaded_tiles.len(), total_points, min_upm, max_upm
             );
-            log::info!(
-                "Dataset center ECEF(m)=({:.3},{:.3},{:.3}) -> geodetic ({:.6}°, {:.6}°). \
-                 Anchor spread radius ~{:.1} m. Start altitude set to {:.1} m.",
-                center_ecef_m[0], center_ecef_m[1], center_ecef_m[2],
-                lat, lon, radius_m, start_alt_m
-            );
+            if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
+                log::info!(
+                    "Dataset center ECEF(m)=({:.3},{:.3},{:.3}) -> geodetic ({:.6}°, {:.6}°). \
+                     Anchor spread radius ~{:.1} m. Start altitude set to {:.1} m.",
+                    center_ecef_m[0], center_ecef_m[1], center_ecef_m[2],
+                    lat, lon, radius_m, start_alt_m
+                );
+            } else {
+                log::info!(
+                    "Dataset center ECEF(m)=({:.3},{:.3},{:.3}). \
+                     Anchor spread radius ~{:.1} m. Start altitude set to {:.1} m.",
+                    center_ecef_m[0], center_ecef_m[1], center_ecef_m[2],
+                    radius_m, start_alt_m
+                );
+            }
         }
 
         self.tiles = loaded_tiles;

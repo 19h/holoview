@@ -1,9 +1,16 @@
 use crate::camera::Camera;
 use crate::data::types::{PointInstance, TileGpu};
 use anyhow::Result;
-use hypc::{ecef_to_geodetic, read_file, smc1_decode_rle, HypcTile, Smc1CoordSpace, Smc1Encoding};
-use std::path::Path;
+use hypc::{
+    ecef_to_geodetic,
+    read_file,
+    smc1_decode_rle,
+    HypcTile,
+    Smc1CoordSpace,
+    Smc1Encoding,
+};
 use log::debug;
+use std::path::Path;
 
 // wgpu::util::DeviceExt is a trait, so we need to bring it into scope.
 mod wgpu_util {
@@ -23,29 +30,31 @@ pub fn load_hypc_tile(
     let upm_f = tile.units_per_meter as f32;
     let upm_f64 = tile.units_per_meter as f64;
 
-    let (smc_w, smc_h, smc_raw): (u32, u32, Option<Vec<u8>>) =
-        if let Some(smc1) = tile.smc1.as_ref() {
-            if smc1.coord_space == Smc1CoordSpace::Crs84BboxNorm && tile.geot.is_some() {
-                let data = match smc1.encoding {
-                    Smc1Encoding::Raw => smc1.data.clone(),
-                    Smc1Encoding::Rle => smc1_decode_rle(&smc1.data)?,
-                };
-                (smc1.width as u32, smc1.height as u32, Some(data))
-            } else {
-                (0, 0, None)
-            }
+    let (smc_w, smc_h, smc_raw): (u32, u32, Option<Vec<u8>>) = if let Some(smc1) = tile.smc1.as_ref() {
+        if smc1.coord_space == Smc1CoordSpace::Crs84BboxNorm && tile.geot.is_some() {
+            let data = match smc1.encoding {
+                Smc1Encoding::Raw => smc1.data.clone(),
+                Smc1Encoding::Rle => smc1_decode_rle(&smc1.data)?,
+            };
+            (smc1.width as u32, smc1.height as u32, Some(data))
         } else {
             (0, 0, None)
-        };
+        }
+    } else {
+        (0, 0, None)
+    };
 
     let geot_deg: Option<(f64, f64, f64, f64)> = tile.geot.map(|g| g.to_deg());
 
     let mut instances = Vec::<PointInstance>::with_capacity(tile.points_units.len());
+
     // Debug: measure per-tile offset AABB in meters
     let mut ofs_min = [f32::INFINITY; 3];
     let mut ofs_max = [f32::NEG_INFINITY; 3];
-    let has_direct_labels =
-        tile.labels.as_ref().map_or(false, |v| v.len() == tile.points_units.len());
+    let has_direct_labels = tile
+        .labels
+        .as_ref()
+        .map_or(false, |v| v.len() == tile.points_units.len());
 
     for (i, p) in tile.points_units.iter().enumerate() {
         let ofs_m = [
@@ -53,9 +62,13 @@ pub fn load_hypc_tile(
             (p[1] as f32) / upm_f,
             (p[2] as f32) / upm_f,
         ];
-        ofs_min[0] = ofs_min[0].min(ofs_m[0]); ofs_max[0] = ofs_max[0].max(ofs_m[0]);
-        ofs_min[1] = ofs_min[1].min(ofs_m[1]); ofs_max[1] = ofs_max[1].max(ofs_m[1]);
-        ofs_min[2] = ofs_min[2].min(ofs_m[2]); ofs_max[2] = ofs_max[2].max(ofs_m[2]);
+
+        ofs_min[0] = ofs_min[0].min(ofs_m[0]);
+        ofs_max[0] = ofs_max[0].max(ofs_m[0]);
+        ofs_min[1] = ofs_min[1].min(ofs_m[1]);
+        ofs_max[1] = ofs_max[1].max(ofs_m[1]);
+        ofs_min[2] = ofs_min[2].min(ofs_m[2]);
+        ofs_max[2] = ofs_max[2].max(ofs_m[2]);
 
         let mut label: u8 = if has_direct_labels {
             tile.labels.as_ref().unwrap()[i]
@@ -64,9 +77,7 @@ pub fn load_hypc_tile(
         };
 
         if label == 0 {
-            if let (Some(ref raw), Some((lon_min, lon_max, lat_min, lat_max))) =
-                (smc_raw.as_ref(), geot_deg)
-            {
+            if let (Some(ref raw), Some((lon_min, lon_max, lat_min, lat_max))) = (smc_raw.as_ref(), geot_deg) {
                 let px_m = tile.anchor_ecef_units[0] as f64 / upm_f64 + ofs_m[0] as f64;
                 let py_m = tile.anchor_ecef_units[1] as f64 / upm_f64 + ofs_m[1] as f64;
                 let pz_m = tile.anchor_ecef_units[2] as f64 / upm_f64 + ofs_m[2] as f64;
@@ -76,12 +87,12 @@ pub fn load_hypc_tile(
                 let u = ((lon_deg - lon_min) / (lon_max - lon_min + 1e-12)).clamp(0.0, 1.0);
                 let v = ((lat_deg - lat_min) / (lat_max - lat_min + 1e-12)).clamp(0.0, 1.0);
 
-                let ix = (u * (smc_w as f64)) as i32;
-                let iy = (v * (smc_h as f64)) as i32;
+                let ix = (u * smc_w as f64) as i32;
+                let iy = (v * smc_h as f64) as i32;
                 let ix = ix.clamp(0, smc_w.saturating_sub(1) as i32) as usize;
                 let iy = iy.clamp(0, smc_h.saturating_sub(1) as i32) as usize;
 
-                let idx = iy * (smc_w as usize) + ix;
+                let idx = iy * smc_w as usize + ix;
                 if let Some(l) = raw.get(idx) {
                     label = *l;
                 }
@@ -101,15 +112,27 @@ pub fn load_hypc_tile(
         tile.anchor_ecef_units[1] as f64 / upm64,
         tile.anchor_ecef_units[2] as f64 / upm64,
     ];
-    let _ext = [ofs_max[0]-ofs_min[0], ofs_max[1]-ofs_min[1], ofs_max[2]-ofs_min[2]];
+    let _ext = [
+        ofs_max[0] - ofs_min[0],
+        ofs_max[1] - ofs_min[1],
+        ofs_max[2] - ofs_min[2],
+    ];
     debug!(
         "HYPC {}: pts={}, upm={}, anchor_ecef_m=({:.3},{:.3},{:.3}), ofs_AABB_m=min({:.2},{:.2},{:.2}) max({:.2},{:.2},{:.2})",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?"),
         tile.points_units.len(),
         tile.units_per_meter,
-        a_m[0], a_m[1], a_m[2],
-        ofs_min[0], ofs_min[1], ofs_min[2],
-        ofs_max[0], ofs_max[1], ofs_max[2]
+        a_m[0],
+        a_m[1],
+        a_m[2],
+        ofs_min[0],
+        ofs_min[1],
+        ofs_min[2],
+        ofs_max[0],
+        ofs_max[1],
+        ofs_max[2]
     );
 
     let vtx = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

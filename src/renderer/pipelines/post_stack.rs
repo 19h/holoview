@@ -1,13 +1,17 @@
 use std::time::Instant;
 use wgpu::util::DeviceExt;
 
-/// Formats we use inside the stack
+/// Intermediate texture format
 const INTERMEDIATE_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// FS triangle verts
-const FS_TRI: [[f32; 2]; 3] = [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]];
+/// Full-screen triangle vertices
+const FS_TRI: [[f32; 2]; 3] = [
+    [-1.0, -1.0],
+    [3.0, -1.0],
+    [-1.0, 3.0],
+];
 
-/// Ping-pong textures
+/// Ping‑pong textures for multi‑pass rendering
 pub struct PingPong {
     pub ping: wgpu::TextureView,
     pub pong: wgpu::TextureView,
@@ -35,10 +39,12 @@ impl PingPong {
                 view_formats: &[],
             })
         }
+
         let tex_ping = make_tex(device, width, height);
         let tex_pong = make_tex(device, width, height);
         let ping = tex_ping.create_view(&wgpu::TextureViewDescriptor::default());
         let pong = tex_pong.create_view(&wgpu::TextureViewDescriptor::default());
+
         Self {
             ping,
             pong,
@@ -60,7 +66,7 @@ impl PingPong {
     }
 }
 
-// -------------------- Pass Structs --------------------
+// -------------------- Uniform Buffers --------------------
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
@@ -69,12 +75,14 @@ struct UboEdl {
     strength: f32,
     radius_px: f32,
 }
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
 struct UboSem {
     amount: f32,
     _pad: [f32; 3],
 }
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
 struct UboRgb {
@@ -82,6 +90,7 @@ struct UboRgb {
     amount: f32,
     angle: f32,
 }
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
 struct UboCrt {
@@ -92,6 +101,8 @@ struct UboCrt {
     _pad: f32,
 }
 
+// -------------------- Pass Types --------------------
+
 struct EdlPass {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
@@ -99,6 +110,7 @@ struct EdlPass {
     ubo: wgpu::Buffer,
     fs_vbo: wgpu::Buffer,
 }
+
 struct SemPost {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
@@ -106,6 +118,7 @@ struct SemPost {
     ubo: wgpu::Buffer,
     fs_vbo: wgpu::Buffer,
 }
+
 struct RgbShiftPass {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
@@ -113,6 +126,7 @@ struct RgbShiftPass {
     ubo: wgpu::Buffer,
     fs_vbo: wgpu::Buffer,
 }
+
 struct CrtPass {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
@@ -121,7 +135,7 @@ struct CrtPass {
     fs_vbo: wgpu::Buffer,
 }
 
-// -------------------- PostParams & PostStack --------------------
+// -------------------- Post Parameters & Stack --------------------
 
 #[derive(Clone, Copy, Debug)]
 pub struct PostParams {
@@ -185,7 +199,7 @@ impl PostStack {
         self.pingpong.resize(device, width, height);
     }
 
-    /// Execute: EDL -> SemGrade -> RGBShift -> CRT
+    /// Run the post‑processing chain: EDL → Semantic → RGB shift → CRT
     pub fn run(
         &self,
         device: &wgpu::Device,
@@ -200,7 +214,7 @@ impl PostStack {
         let inv_size = [1.0 / w, 1.0 / h];
         let t = self.start.elapsed().as_secs_f32();
 
-        // 1) EDL: scene color -> ping
+        // 1️⃣ EDL
         self.edl.draw(
             device,
             queue,
@@ -213,7 +227,7 @@ impl PostStack {
             self.params.edl_radius_px,
         );
 
-        // 2) Semantic grade: ping -> pong
+        // 2️⃣ Semantic grading
         self.sem.draw(
             device,
             queue,
@@ -224,7 +238,7 @@ impl PostStack {
             self.params.sem_amount,
         );
 
-        // 3) RGB Shift: pong -> ping
+        // 3️⃣ RGB shift
         self.rgb.draw(
             device,
             queue,
@@ -237,7 +251,7 @@ impl PostStack {
             self.params.rgb_angle,
         );
 
-        // 4) CRT: ping -> swapchain
+        // 4️⃣ CRT effect
         self.crt.draw(
             device,
             queue,
@@ -263,40 +277,51 @@ macro_rules! create_post_pass {
                     label: Some(concat!(stringify!($name), " Layout")),
                     entries: &[
                         wgpu::BindGroupLayoutEntry {
-                            binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Texture {
                                 sample_type: wgpu::TextureSampleType::Float { filterable: false },
                                 view_dimension: wgpu::TextureViewDimension::D2,
                                 multisampled: false,
-                            }, count: None
+                            },
+                            count: None,
                         },
                         wgpu::BindGroupLayoutEntry {
-                            binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Texture {
                                 sample_type: wgpu::TextureSampleType::Float { filterable: false },
                                 view_dimension: wgpu::TextureViewDimension::D2,
                                 multisampled: false,
-                            }, count: None
+                            },
+                            count: None,
                         },
                         wgpu::BindGroupLayoutEntry {
-                            binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                            count: None
+                            count: None,
                         },
                         wgpu::BindGroupLayoutEntry {
-                            binding: 3, visibility: wgpu::ShaderStages::FRAGMENT,
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Buffer {
                                 ty: wgpu::BufferBindingType::Uniform,
                                 has_dynamic_offset: false,
-                                min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<$ubo_type>() as u64),
-                            }, count: None
+                                min_binding_size: wgpu::BufferSize::new(
+                                    std::mem::size_of::<$ubo_type>() as u64,
+                                ),
+                            },
+                            count: None,
                         },
                     ],
                 });
 
                 let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some($shader),
-                    source: wgpu::ShaderSource::Wgsl(include_str!(concat!("../../../shaders/", $shader)).into()),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!(concat!("../../../shaders/", $shader)).into(),
+                    ),
                 });
 
                 let pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -314,7 +339,11 @@ macro_rules! create_post_pass {
                         buffers: &[wgpu::VertexBufferLayout {
                             array_stride: std::mem::size_of::<[f32; 2]>() as u64,
                             step_mode: wgpu::VertexStepMode::Vertex,
-                            attributes: &[wgpu::VertexAttribute { shader_location: 0, offset: 0, format: wgpu::VertexFormat::Float32x2 }],
+                            attributes: &[wgpu::VertexAttribute {
+                                shader_location: 0,
+                                offset: 0,
+                                format: wgpu::VertexFormat::Float32x2,
+                            }],
                         }],
                         compilation_options: wgpu::PipelineCompilationOptions::default(),
                     },
@@ -354,7 +383,13 @@ macro_rules! create_post_pass {
                     usage: wgpu::BufferUsages::VERTEX,
                 });
 
-                Self { pipeline, layout, sampler, ubo, fs_vbo }
+                Self {
+                    pipeline,
+                    layout,
+                    sampler,
+                    ubo,
+                    fs_vbo,
+                }
             }
         }
     };
@@ -395,60 +430,191 @@ fn execute_pass(
 }
 
 impl EdlPass {
-    pub fn draw(&self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::TextureView, t_color: &wgpu::TextureView, t_depthlin: &wgpu::TextureView, inv_size: [f32; 2], strength: f32, radius_px: f32) {
-        queue.write_buffer(&self.ubo, 0, bytemuck::bytes_of(&UboEdl { inv_size, strength, radius_px }));
+    pub fn draw(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &wgpu::TextureView,
+        t_color: &wgpu::TextureView,
+        t_depthlin: &wgpu::TextureView,
+        inv_size: [f32; 2],
+        strength: f32,
+        radius_px: f32,
+    ) {
+        queue.write_buffer(
+            &self.ubo,
+            0,
+            bytemuck::bytes_of(&UboEdl {
+                inv_size,
+                strength,
+                radius_px,
+            }),
+        );
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("EDL Bind"), layout: &self.layout,
+            label: Some("EDL Bind"),
+            layout: &self.layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(t_color) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(t_depthlin) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: self.ubo.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(t_color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(t_depthlin),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.ubo.as_entire_binding(),
+                },
             ],
         });
         execute_pass(&self.pipeline, encoder, &bind, &self.fs_vbo, dst, "EDL Pass");
     }
 }
+
 impl SemPost {
-    pub fn draw(&self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::TextureView, t_src: &wgpu::TextureView, t_depthlin: &wgpu::TextureView, amount: f32) {
-        queue.write_buffer(&self.ubo, 0, bytemuck::bytes_of(&UboSem { amount, _pad: [0.0; 3] }));
+    pub fn draw(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &wgpu::TextureView,
+        t_src: &wgpu::TextureView,
+        t_depthlin: &wgpu::TextureView,
+        amount: f32,
+    ) {
+        queue.write_buffer(
+            &self.ubo,
+            0,
+            bytemuck::bytes_of(&UboSem {
+                amount,
+                _pad: [0.0; 3],
+            }),
+        );
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("SemPost Bind"), layout: &self.layout,
+            label: Some("SemPost Bind"),
+            layout: &self.layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(t_src) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(t_depthlin) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: self.ubo.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(t_src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(t_depthlin),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.ubo.as_entire_binding(),
+                },
             ],
         });
         execute_pass(&self.pipeline, encoder, &bind, &self.fs_vbo, dst, "SemPost Pass");
     }
 }
+
 impl RgbShiftPass {
-    pub fn draw(&self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::TextureView, t_src: &wgpu::TextureView, t_depthlin: &wgpu::TextureView, inv_size: [f32; 2], amount: f32, angle: f32) {
-        queue.write_buffer(&self.ubo, 0, bytemuck::bytes_of(&UboRgb { inv_size, amount, angle }));
+    pub fn draw(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &wgpu::TextureView,
+        t_src: &wgpu::TextureView,
+        t_depthlin: &wgpu::TextureView,
+        inv_size: [f32; 2],
+        amount: f32,
+        angle: f32,
+    ) {
+        queue.write_buffer(
+            &self.ubo,
+            0,
+            bytemuck::bytes_of(&UboRgb {
+                inv_size,
+                amount,
+                angle,
+            }),
+        );
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("RgbShift Bind"), layout: &self.layout,
+            label: Some("RgbShift Bind"),
+            layout: &self.layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(t_src) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(t_depthlin) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: self.ubo.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(t_src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(t_depthlin),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.ubo.as_entire_binding(),
+                },
             ],
         });
         execute_pass(&self.pipeline, encoder, &bind, &self.fs_vbo, dst, "RgbShift Pass");
     }
 }
+
 impl CrtPass {
-    pub fn draw(&self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::TextureView, t_src: &wgpu::TextureView, t_depthlin: &wgpu::TextureView, inv_size: [f32; 2], time: f32, intensity: f32, vignette: f32) {
-        queue.write_buffer(&self.ubo, 0, bytemuck::bytes_of(&UboCrt { inv_size, time, intensity, vignette, _pad: 0.0 }));
+    pub fn draw(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &wgpu::TextureView,
+        t_src: &wgpu::TextureView,
+        t_depthlin: &wgpu::TextureView,
+        inv_size: [f32; 2],
+        time: f32,
+        intensity: f32,
+        vignette: f32,
+    ) {
+        queue.write_buffer(
+            &self.ubo,
+            0,
+            bytemuck::bytes_of(&UboCrt {
+                inv_size,
+                time,
+                intensity,
+                vignette,
+                _pad: 0.0,
+            }),
+        );
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Crt Bind"), layout: &self.layout,
+            label: Some("Crt Bind"),
+            layout: &self.layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(t_src) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(t_depthlin) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: self.ubo.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(t_src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(t_depthlin),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.ubo.as_entire_binding(),
+                },
             ],
         });
         execute_pass(&self.pipeline, encoder, &bind, &self.fs_vbo, dst, "Crt Pass");
