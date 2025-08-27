@@ -1,430 +1,142 @@
-// src/renderer/pipelines/hologram.rs
-
+use crate::data::types::{PointInstance, TileUniformStd140 as TileUniform};
 use wgpu::util::DeviceExt;
-use glam::{Mat4, Vec3};
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct HoloUniforms {
-    pub view: Mat4,
-    pub proj: Mat4,
-    pub viewport: [f32; 2],
-    pub base_size_px: f32,
-    pub size_atten: f32,
-    pub time: f32,
-    pub near: f32,
-    pub far: f32,
-    pub _pad: f32,
-    pub decode_min: Vec3, pub _pad0: f32,
-    pub decode_max: Vec3, pub _pad1: f32,
-    pub cyan:       Vec3, pub _pad2: f32,
-    pub red:        Vec3, pub _pad3: f32,
-}
-impl Default for HoloUniforms {
-    fn default() -> Self {
-        Self {
-            view: Mat4::IDENTITY, proj: Mat4::IDENTITY,
-            viewport: [1280.0, 720.0], base_size_px: 4.0, size_atten: 1.0,
-            time: 0.0, near: 0.5, far: 8000.0, _pad: 0.0,
-            decode_min: Vec3::ZERO, decode_max: Vec3::ONE,
-            cyan: Vec3::new(1.1, 0.5, 0.2),
-            red:  Vec3::new(0.5, 0.5, 0.2),
-            _pad0: 0.0, _pad1: 0.0, _pad2: 0.0, _pad3: 0.0,
-        }
-    }
-}
 
 pub struct HologramPipeline {
     pub pipeline: wgpu::RenderPipeline,
-    pub bind_group: wgpu::BindGroup,
-    pub uniform_buffer: wgpu::Buffer,
-    pub quad_vb: wgpu::Buffer,
-    pub uniforms: HoloUniforms,
-    pub bgl: wgpu::BindGroupLayout,
-    pub bgl_tile: wgpu::BindGroupLayout,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct TileUniforms {
-    pub dmin_world: [f32; 2],
-    pub dmax_world: [f32; 2],
-    pub z_bias: f32,
-    pub _pad_after_z: f32,
-    pub xy_bias: [f32; 2],
-    pub _padding: [u32; 22],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Instance {
-    pub position: [f32; 3],
-}
-
-impl Instance {
-    pub fn layout() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Instance>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[wgpu::VertexAttribute {
-                offset: 0,
-                shader_location: 1,
-                format: wgpu::VertexFormat::Float32x3,
-            }],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct QuadVertex {
-    corner: [f32; 2],
-}
-
-impl QuadVertex {
-    fn layout() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<QuadVertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[wgpu::VertexAttribute {
-                offset: 0,
-                shader_location: 0,
-                format: wgpu::VertexFormat::Float32x2,
-            }],
-        }
-    }
+    pub tile_layout: wgpu::BindGroupLayout,
+    quad_vb: wgpu::Buffer,
 }
 
 impl HologramPipeline {
     pub fn new(
         device: &wgpu::Device,
-        scene_format: wgpu::TextureFormat,
-        depthlin_format: wgpu::TextureFormat,
+        color_fmt: wgpu::TextureFormat,
+        depth_fmt: wgpu::TextureFormat,
+        dlin_fmt: wgpu::TextureFormat,
     ) -> Self {
-        let uniforms = HoloUniforms::default();
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Holo Uniforms"),
-            contents: bytemuck::bytes_of(&uniforms),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Holo BGL"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
+        let tile_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("HYPC Tile UBO Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(
+                        std::mem::size_of::<TileUniform>() as u64
+                    ),
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false, view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                },
-            ],
-        });
-
-        let bgl_tile = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Holo BGL (tile)"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-            ],
-        });
-
-        let sem_dummy = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("SMC1 Dummy"), size: wgpu::Extent3d::default(), mip_level_count: 1, sample_count: 1,
-            dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[],
-        });
-        let sem_dummy_view = sem_dummy.create_view(&wgpu::TextureViewDescriptor::default());
-        let sem_sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("SMC1 Nearest"), ..Default::default() });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Holo BG"), layout: &bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sem_dummy_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sem_sampler) },
-            ],
-        });
-
-        let corners = [
-            QuadVertex { corner: [-1.0, -1.0] }, QuadVertex { corner: [ 1.0, -1.0] }, QuadVertex { corner: [ 1.0,  1.0] },
-            QuadVertex { corner: [-1.0, -1.0] }, QuadVertex { corner: [ 1.0,  1.0] }, QuadVertex { corner: [-1.0,  1.0] },
-        ];
-        let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Point Quad VB"),
-            contents: bytemuck::cast_slice(&corners),
-            usage: wgpu::BufferUsages::VERTEX,
+                count: None,
+            }],
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Holo WGSL"),
-            source: wgpu::ShaderSource::Wgsl(HOLO_WGSL.into()),
+            label: Some("shaders/hypc_points.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../../shaders/hypc_points.wgsl").into()),
         });
 
+        let quad_corners: [[f32; 2]; 6] = [
+            [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0],
+            [-1.0, -1.0], [1.0, 1.0], [-1.0, 1.0],
+        ];
+        let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Hologram Quad VB"),
+            contents: bytemuck::cast_slice(&quad_corners),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let vbuf_layouts = [
+            // Quad corner buffer
+            wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<[f32; 2]>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    shader_location: 0, // Corresponds to @location(0) in WGSL
+                    offset: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                }],
+            },
+            // Per-instance data buffer
+            wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<PointInstance>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &[
+                    // ofs_m
+                    wgpu::VertexAttribute {
+                        shader_location: 1, // Corresponds to @location(1) in WGSL
+                        offset: 0,
+                        format: wgpu::VertexFormat::Float32x3,
+                    },
+                    // label
+                    wgpu::VertexAttribute {
+                        shader_location: 2, // Corresponds to @location(2) in WGSL
+                        offset: 12,
+                        format: wgpu::VertexFormat::Uint32,
+                    },
+                ],
+            },
+        ];
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Holo PL"),
-            bind_group_layouts: &[&bgl, &bgl_tile],
+            label: Some("HYPC Hologram PipelineLayout"),
+            bind_group_layouts: &[&tile_layout],
             push_constant_ranges: &[],
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Holo Pipeline"),
+            label: Some("HYPC Hologram Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader, entry_point: "vs_main",
-                buffers: &[QuadVertex::layout(), Instance::layout()],
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &vbuf_layouts,
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader, entry_point: "fs_main",
-                targets: &[
-                    Some(wgpu::ColorTargetState {
-                        format: scene_format,
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
-                            alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    Some(wgpu::ColorTargetState {
-                        format: depthlin_format,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                ],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
+                format: depth_fmt,
                 depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState {
-                count: 4, // Must match SAMPLE_COUNT in renderer/targets.rs
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: color_fmt,
+                        //blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: dlin_fmt,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
             multiview: None,
         });
 
-        Self { pipeline, bind_group, uniform_buffer, quad_vb, uniforms, bgl, bgl_tile }
-    }
-
-    pub fn bind_group_for_semantics(&self, device: &wgpu::Device, sem_view: &wgpu::TextureView, sem_sampler: &wgpu::Sampler) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Holo BG (tile)"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(sem_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sem_sampler) },
-            ],
-        })
-    }
-
-    pub fn update_uniforms(&mut self, queue: &wgpu::Queue, u: HoloUniforms) {
-        self.uniforms = u;
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
-    }
-}
-
-pub const HOLO_WGSL: &str = r#"
-struct UBO {
-    view: mat4x4<f32>, proj: mat4x4<f32>,
-    viewport: vec2<f32>, base_size_px: f32, size_atten: f32,
-    time: f32, near: f32, far: f32, _pad: f32,
-    decode_min: vec3<f32>, _pad0: f32,
-    decode_max: vec3<f32>, _pad1: f32,
-    cyan: vec3<f32>, _pad2: f32,
-    red:  vec3<f32>, _pad3: f32,
-};
-@group(0) @binding(0) var<uniform> U: UBO;
-
-// --- SMC1 bindings ---
-@group(0) @binding(1) var tSMC1: texture_2d<f32>;   // R8Unorm labels → [0,1]
-@group(0) @binding(2) var sSMC1: sampler;           // nearest, clamp
-
-// per-tile uniform block for SMC1 UVs
-// NOTE: This layout is correct and matches the padded Rust struct.
-// vec2 has 8-byte alignment in uniform buffers.
-struct TileUBO {
-    dmin_world: vec2<f32>,   // align 8, offset 0
-    dmax_world: vec2<f32>,   // align 8, offset 8
-    z_bias: f32,             // align 4, offset 16
-    // implicit 4-byte padding here
-    xy_bias: vec2<f32>,      // align 8, offset 24
-    // ... more padding
-};
-@group(1) @binding(0) var<uniform> T: TileUBO;
-
-struct VSIn { @location(0) corner: vec2<f32>, @location(1) center: vec3<f32> };
-struct VSOut {
-    @builtin(position) clip: vec4<f32>,
-    @location(0) local: vec2<f32>,
-    @location(1) hfac: f32,
-    @location(2) center_ndc_depth: f32,
-    @location(3) eye_depth: f32,
-    @location(4) uv_sem: vec2<f32>,
-}
-
-@vertex
-fn vs_main(in: VSIn) -> VSOut {
-    // Apply per-tile XY & Z biases
-    let world_xy = in.center.xy + T.xy_bias;
-    let world = vec3<f32>(world_xy, in.center.z + T.z_bias);
-
-    // Transform to view space
-    let view_pos = U.view * vec4<f32>(world, 1.0);
-
-    // Camera looks down -Z in view space.
-    let behind   = view_pos.z >= 0.0;
-    let too_close = -view_pos.z < U.near;
-
-    // Cull points that are behind the camera or too close.
-    if (behind || too_close) {
-        var out: VSOut;
-        // Push outside clip space – it will be trivially discarded.
-        out.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
-        out.local = in.corner;
-        out.hfac = 0.0;
-        out.center_ndc_depth = 1.0;
-        out.eye_depth = U.far;
-        out.uv_sem = vec2<f32>(0.0);
-        return out;
-    }
-
-    // Sprite size attenuation (distance is -view_pos.z because camera looks -Z)
-    let dist = -view_pos.z;
-    let size_px = U.base_size_px * clamp(200.0 / (U.size_atten * dist), 0.6, 4.5);
-    let half_px = 0.5 * size_px;
-    let ndc_dx = (half_px * 2.0) / U.viewport.x;
-    let ndc_dy = (half_px * 2.0) / U.viewport.y;
-
-    let clip_center = U.proj * view_pos;
-
-    // Extra safety: ensure w is positive before expanding.
-    if (clip_center.w <= 0.0) {
-        var out: VSOut;
-        out.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
-        out.local = in.corner;
-        out.hfac = 0.0;
-        out.center_ndc_depth = 1.0;
-        out.eye_depth = dist;
-        out.uv_sem = vec2<f32>(0.0);
-        return out;
-    }
-
-    var clip = clip_center;
-    let offset = vec2<f32>(in.corner.x * ndc_dx, in.corner.y * ndc_dy) * clip_center.w;
-    clip.x += offset.x;
-    clip.y += offset.y;
-
-    let hr = max(1e-6, U.decode_max.z - U.decode_min.z);
-    let hfac = clamp((world.z - U.decode_min.z) / hr, 0.0, 1.0);
-
-    // --- decode-XY → [0,1]^2 UV for SMC1 ---
-    let span = max(vec2<f32>(1e-6, 1e-6), (T.dmax_world - T.dmin_world));
-    let uv_sem = clamp((world_xy - T.dmin_world) / span, vec2<f32>(0.0), vec2<f32>(1.0));
-
-    var out: VSOut;
-    out.clip = clip;
-    out.local = in.corner;
-    out.hfac = hfac;
-    out.center_ndc_depth = clip_center.z / clip_center.w;
-    out.eye_depth = dist;
-    out.uv_sem = uv_sem;
-    return out;
-}
-
-fn hash(p: vec2<f32>) -> f32 {
-    return fract(sin(dot(p, vec2<f32>(12.9898,78.233))) * 43758.5453);
-}
-
-// --- fixed palette (10 classes) ---
-// 0:Unknown 1:Building 2:RoadMajor 3:RoadMinor 4:Path 5:Water 6:Park 7:Woodland 8:Railway 9:Parking
-const PAL: array<vec3<f32>, 10> = array<vec3<f32>, 10>(
-    vec3<f32>(0.12, 0.12, 0.12), // Unknown
-    vec3<f32>(1.00, 0.80, 0.25), // Building
-    vec3<f32>(1.00, 1.00, 1.00), // RoadMajor
-    vec3<f32>(0.75, 0.75, 0.75), // RoadMinor
-    vec3<f32>(0.85, 0.65, 0.45), // Path
-    vec3<f32>(0.20, 0.50, 1.00), // Water
-    vec3<f32>(0.12, 0.85, 0.35), // Park
-    vec3<f32>(0.00, 0.55, 0.00), // Woodland
-    vec3<f32>(0.65, 0.25, 0.85), // Railway
-    vec3<f32>(0.78, 0.84, 0.92)  // Parking
-);
-
-struct FSOut {
-    @location(0) color: vec4<f32>,
-    @location(1) depthlin: vec4<f32>,
-    @builtin(frag_depth) depth: f32,
-}
-
-@fragment
-fn fs_main(in: VSOut) -> FSOut {
-    // Anti-aliased circular disc
-    let r2 = dot(in.local, in.local);
-    let r = sqrt(r2);
-    let aaw = fwidth(r); // screen-space derivative of radius
-    let circle_alpha = 1.0 - smoothstep(1.0 - aaw, 1.0, r);
-    if (circle_alpha < 0.001) { discard; }
-
-    // base holographic look
-    let falloff = pow(1.0 - r2, 1.6);
-    let n = hash(in.clip.xy + vec2<f32>(U.time, U.time));
-    let flicker = 0.92 + 0.16 * (n - 0.5);
-    let holo = mix(U.red, U.cyan, in.hfac) * falloff * flicker * 1.25;
-
-    // --- sample SMC1 label (R8Unorm → [0,1]) and use per-class color when label>0
-    let lblNorm = textureSampleLevel(tSMC1, sSMC1, in.uv_sem, 0.0).r;
-    let lblU = u32(round(clamp(lblNorm, 0.0, 1.0) * 255.0));
-    let lbl = min(lblU, 9u); // our palette has 10 entries
-
-    var color = holo;
-    if (lblU > 0u) {
-        // Slight lighting via falloff to keep dots readable
-        var palColor = PAL[0]; // default to Unknown
-        switch (lbl) {
-            case 0u: { palColor = PAL[0]; } // Unknown
-            case 1u: { palColor = PAL[1]; } // Building
-            case 2u: { palColor = PAL[2]; } // RoadMajor
-            case 3u: { palColor = PAL[3]; } // RoadMinor
-            case 4u: { palColor = PAL[4]; } // Path
-            case 5u: { palColor = PAL[5]; } // Water
-            case 6u: { palColor = PAL[6]; } // Park
-            case 7u: { palColor = PAL[7]; } // Woodland
-            case 8u: { palColor = PAL[8]; } // Railway
-            case 9u: { palColor = PAL[9]; } // Parking
-            default: { palColor = PAL[0]; } // fallback to Unknown
+        Self {
+            pipeline,
+            tile_layout,
+            quad_vb,
         }
-        color = palColor * (0.55 + 0.45 * falloff);
     }
 
-    let alpha = falloff * 0.95 * circle_alpha;
-    let lin = clamp((in.eye_depth - U.near) / max(1e-6, U.far - U.near), 0.0, 1.0);
-
-    var o: FSOut;
-    o.color    = vec4<f32>(color, alpha);
-    o.depthlin = vec4<f32>(lin, lin, lin, 1.0);
-    o.depth    = in.center_ndc_depth;
-    return o;
+    pub fn draw_tile<'a>(&'a self, rpass: &mut wgpu::RenderPass<'a>, tile: &'a crate::data::types::TileGpu) {
+        rpass.set_pipeline(&self.pipeline);
+        rpass.set_bind_group(0, &tile.bind, &[]);
+        rpass.set_vertex_buffer(0, self.quad_vb.slice(..));
+        rpass.set_vertex_buffer(1, tile.vtx.slice(..));
+        rpass.draw(0..6, 0..tile.instances_len);
+    }
 }
-"#;

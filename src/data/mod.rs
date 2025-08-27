@@ -2,14 +2,11 @@
 //! Data handling modules for the holographic viewer.
 //!
 //! This module provides functionality for:
-//! - Point cloud loading and quantization
-//! - Data types and structures
-//! - Tile alignment algorithms
+//! - Loading HYPC point clouds and preparing them for the GPU.
+//! - Defining the data structures for GPU buffers.
 
 pub mod point_cloud;
-pub mod tile_aligner;
 pub mod types;
 
-// Re-export commonly used types
-pub use types::{TileKey, GeoCrs, GeoExtentDeg, SemanticMask};
-pub use point_cloud::QuantizedPointCloud;
+// Re-export commonly used types for convenience.
+pub use self::types::{PointInstance, TileGpu, TileKey32, TileUniformStd140};

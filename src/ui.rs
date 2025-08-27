@@ -1,22 +1,9 @@
-// src/ui.rs
-use crate::renderer::context::GpuContext;
-use winit::window::Window;
+//! UI rendering using egui.
 
-#[allow(clippy::too_many_arguments)]
-pub fn draw_hud(
-    egui_ctx: &mut egui::Context,
-    egui_state: &mut egui_winit::State,
-    egui_renderer: &mut egui_wgpu::Renderer,
-    window: &Window,
-    gpu_context: &GpuContext,
-    encoder: &mut wgpu::CommandEncoder,
-    swap_view: &wgpu::TextureView,
-    total_points: u32,
-    altitude: i32,
-) {
-    let egui_input = egui_state.take_egui_input(window);
-    egui_ctx.begin_frame(egui_input);
+use egui::{Area, Frame, RichText};
 
+/// Draws the HUD overlay, including corner brackets and status text.
+pub fn draw_hud(egui_ctx: &egui::Context, altitude: i32, total_points: u32) {
     // Corner brackets & dot painter
     {
         let painter = egui_ctx.layer_painter(egui::LayerId::new(
@@ -92,8 +79,6 @@ pub fn draw_hud(
 
     // Top-left status text
     {
-        use egui::{Area, Frame, RichText};
-
         Area::new("hud_text".into())
             .interactable(false)
             .movable(false)
@@ -127,49 +112,5 @@ pub fn draw_hud(
                     );
                 });
             });
-    }
-
-    // Render egui to the swapchain
-    let egui_output = egui_ctx.end_frame();
-    let shapes = egui_ctx.tessellate(egui_output.shapes, egui_ctx.pixels_per_point());
-
-    let screen_descriptor = egui_wgpu::ScreenDescriptor {
-        size_in_pixels: [gpu_context.config.width, gpu_context.config.height],
-        pixels_per_point: egui_state.egui_ctx().pixels_per_point(),
-    };
-
-    for (id, delta) in &egui_output.textures_delta.set {
-        egui_renderer.update_texture(&gpu_context.device, &gpu_context.queue, *id, delta);
-    }
-
-    egui_renderer.update_buffers(
-        &gpu_context.device,
-        &gpu_context.queue,
-        encoder,
-        &shapes,
-        &screen_descriptor,
-    );
-
-    {
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("HUD"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: swap_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-
-        egui_renderer.render(&mut render_pass, &shapes, &screen_descriptor);
-    }
-
-    for id in &egui_output.textures_delta.free {
-        egui_renderer.free_texture(id);
     }
 }

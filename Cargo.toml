@@ -10,7 +10,7 @@ winit = "0.29"
 pollster = "0.3"
 
 # Math & POD
-glam = { version = "0.30", features = ["bytemuck"] }
+glam = { version = "0.28", features = ["bytemuck"] }
 bytemuck = { version = "1.14", features = ["derive"] }
 
 # UI
@@ -19,15 +19,12 @@ egui-wgpu = "0.28"
 egui-winit = "0.28"
 
 # Asset loading
-ply-rs = "0.1"
-linked-hash-map = "0.5"
+walkdir = "2.5"
 
 # Utils
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
-rayon = "1.8"
-miniz_oxide = "0.8.9"
-walkdir = "2.5.0"
 
+# Local format library
 hypc = { path = "crates/hypc" }

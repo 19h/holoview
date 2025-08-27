@@ -1,49 +1,116 @@
-// src/camera.rs
-use glam::{Mat4, Vec3};
+use crate::data::types::TileUniformStd140 as TileUniform;
+use glam::{Mat3, Mat4, Vec3};
+use hypc::{geodetic_to_ecef, split_f64_to_f32_pair};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
+#[derive(Debug, Clone)]
 pub struct Camera {
-    pub position: Vec3,
-    pub target: Vec3,
-    pub up: Vec3,
-    pub fov_y_rad: f32,
-    pub near: f32,
-    pub far: f32,
+    // Geodetic pose
+    pub lat_deg: f64,
+    pub lon_deg: f64,
+    pub h_m: f64,
+
+    // Orientation in ENU (yaw/pitch/roll in radians)
+    pub yaw: f32,
+    pub pitch: f32,
+    pub roll: f32,
+
+    // Projection
+    pub proj: Mat4,
 }
 
 impl Camera {
-    pub fn view_matrix(&self) -> Mat4 {
-        Mat4::look_at_rh(self.position, self.target, self.up)
+    pub fn new(lat_deg: f64, lon_deg: f64, h_m: f64, proj: Mat4) -> Self {
+        Self {
+            lat_deg,
+            lon_deg,
+            h_m,
+            yaw: 0.0,
+            pitch: -40.0f32.to_radians(), // Default pitch down
+            roll: 0.0,
+            proj,
+        }
     }
 
-    pub fn projection_matrix_gl(&self, aspect_ratio: f32) -> Mat4 {
-        Mat4::perspective_rh_gl(self.fov_y_rad, aspect_ratio, self.near, self.far)
+    #[inline]
+    pub fn ecef_m(&self) -> [f64; 3] {
+        geodetic_to_ecef(self.lat_deg, self.lon_deg, self.h_m)
+    }
+
+    /// ECEF->ENU rotation at the camera location.
+    fn ecef_to_enu_matrix(&self) -> Mat3 {
+        let lat = self.lat_deg.to_radians();
+        let lon = self.lon_deg.to_radians();
+        let (sl, cl) = lat.sin_cos();
+        let (so, co) = lon.sin_cos();
+
+        let e = Vec3::new(-so as f32, co as f32, 0.0);
+        let n = Vec3::new((-sl * co) as f32, (-sl * so) as f32, cl as f32);
+        let u = Vec3::new((cl * co) as f32, (cl * so) as f32, sl as f32);
+
+        Mat3::from_cols(e, n, u).transpose()
+    }
+
+    /// View*Projection that expects camera-relative ECEF meters.
+    pub fn view_proj_ecef(&self) -> Mat4 {
+        self.proj * self.view_ecef()
+    }
+
+    /// Pure View matrix (rotation only): ECEF -> camera frame.
+    pub fn view_ecef(&self) -> Mat4 {
+        let r_ecef_to_enu = self.ecef_to_enu_matrix();
+        let r_cam = Mat3::from_rotation_z(self.yaw) * Mat3::from_rotation_x(self.pitch);
+        let view_enu = Mat4::from_mat3(r_cam).transpose(); // inverse of camera orientation
+        let to_enu = Mat4::from_mat3(r_ecef_to_enu);
+        view_enu * to_enu
+    }
+
+    /// Build the per-tile uniform given the tile's anchor and rendering parameters.
+    pub fn make_tile_uniform(
+        &self,
+        tile_anchor_units: [i64; 3],
+        units_per_meter: u32,
+        viewport_size: [f32; 2],
+        point_size_px: f32,
+    ) -> TileUniform {
+        let cam_ecef = self.ecef_m();
+        let upm = units_per_meter as f64;
+        let anchor_m = [
+            tile_anchor_units[0] as f64 / upm,
+            tile_anchor_units[1] as f64 / upm,
+            tile_anchor_units[2] as f64 / upm,
+        ];
+        let dx = anchor_m[0] - cam_ecef[0];
+        let dy = anchor_m[1] - cam_ecef[1];
+        let dz = anchor_m[2] - cam_ecef[2];
+        let (hix, lox) = split_f64_to_f32_pair(dx);
+        let (hiy, loy) = split_f64_to_f32_pair(dy);
+        let (hiz, loz) = split_f64_to_f32_pair(dz);
+
+        TileUniform {
+            delta_hi: [hix, hiy, hiz],
+            _pad0: 0.0,
+            delta_lo: [lox, loy, loz],
+            _pad1: 0.0,
+            view_proj: self.view_proj_ecef().to_cols_array_2d(),
+            viewport_size,
+            point_size_px,
+            _pad2: 0.0,
+        }
     }
 }
 
 pub struct CameraController {
     mouse_down: bool,
     last_mouse: Option<(f64, f64)>,
-    zoom_factor: f32,
-    default_distance: f32,
 }
 
 impl CameraController {
-    pub fn new(default_distance: f32) -> Self {
+    pub fn new() -> Self {
         Self {
             mouse_down: false,
             last_mouse: None,
-            zoom_factor: 1.0,
-            default_distance,
         }
-    }
-
-    pub fn set_default_distance(&mut self, distance: f32) {
-        self.default_distance = distance;
-    }
-
-    pub fn reset_zoom(&mut self) {
-        self.zoom_factor = 1.0;
     }
 
     pub fn handle_event(&mut self, event: &WindowEvent, camera: &mut Camera) {
@@ -68,63 +135,23 @@ impl CameraController {
     }
 
     fn handle_scroll(&mut self, delta: f32, camera: &mut Camera) {
-        const ZOOM_STEP: f32 = 1.20;
-        let scale = ZOOM_STEP.powf(-delta);
-
-        let mut offset = camera.position - camera.target;
-        let old_len = offset.length();
-
-        if old_len < 1e-6 {
-            let fallback = self.default_distance.max(camera.near * 2.0);
-            offset = Vec3::new(0.0, -1.0, 0.0) * fallback;
-        }
-
-        offset *= scale;
-
-        let new_len = offset.length();
-        let min_distance = (camera.near * 2.0).max(0.10);
-        let max_distance = (camera.far * 0.90).max(min_distance);
-
-        if new_len < min_distance {
-            offset = offset.normalize_or_zero() * min_distance;
-        } else if new_len > max_distance {
-            offset = offset.normalize_or_zero() * max_distance;
-        }
-
-        camera.position = camera.target + offset;
-
-        if self.default_distance > 0.0 {
-            self.zoom_factor = self.default_distance / offset.length();
-        }
+        let zoom_factor = 1.1f64.powf(-delta as f64);
+        camera.h_m *= zoom_factor;
+        camera.h_m = camera.h_m.clamp(10.0, 1_000_000.0);
     }
 
     fn handle_cursor_orbit(&mut self, xy: (f64, f64), camera: &mut Camera) {
         if let Some(last) = self.last_mouse {
             if self.mouse_down {
-                let dx = (xy.0 - last.0) as f32 * 0.01;
-                let dy = (xy.1 - last.1) as f32 * 0.01;
+                let dx = (xy.0 - last.0) as f32 * 0.005;
+                let dy = (xy.1 - last.1) as f32 * 0.005;
 
-                let to_target = (camera.target - camera.position).normalize_or_zero();
-                let right = to_target.cross(camera.up).normalize_or_zero();
+                camera.yaw -= dx;
+                camera.pitch -= dy;
 
-                let yaw = Mat4::from_axis_angle(camera.up, -dx);
-                let mut dir = yaw.transform_vector3(to_target);
-
-                let pitch = Mat4::from_axis_angle(right, -dy);
-                dir = pitch.transform_vector3(dir);
-
-                // Avoid flipping over by clamping pitch
-                const MIN_Z_NORMALIZED: f32 = 0.05;
-                if dir.z.abs() < MIN_Z_NORMALIZED {
-                    dir.z = dir.z.signum() * MIN_Z_NORMALIZED;
-                    dir = dir.normalize();
-                }
-
-                let current_dist = (camera.position - camera.target).length();
-                camera.position = camera.target - dir * current_dist;
+                camera.pitch = camera.pitch.clamp(-89.9f32.to_radians(), -1.0f32.to_radians());
             }
         }
-
         self.last_mouse = Some(xy);
     }
 }

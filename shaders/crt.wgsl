@@ -13,9 +13,9 @@ struct Uniforms {
 @group(0) @binding(2) var samp: sampler;
 @group(0) @binding(3) var<uniform> UBO: Uniforms;
 
-struct VSOut { 
-    @builtin(position) clip: vec4<f32>, 
-    @location(0) uv: vec2<f32> 
+struct VSOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>
 }
 
 @vertex

@@ -1,50 +1,49 @@
-// src/main.rs
+//! Executable entry point for the Holographic Viewer application.
+
 use anyhow::Result;
 use holographic_viewer::app::App;
 use std::sync::Arc;
 use winit::{
-    dpi::LogicalSize,
     event::{Event, WindowEvent},
-    event_loop::EventLoop,
+    event_loop::{ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowBuilder},
+    window::WindowBuilder,
 };
 
 fn main() -> Result<()> {
-    env_logger::init();
+    // Setup logging with a sensible default if RUST_LOG is unset
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info")
+    ).init();
 
+    // Create the winit event loop and window
     let event_loop = EventLoop::new()?;
-
     let window = Arc::new(
         WindowBuilder::new()
-            .with_title("Holographic City Viewer — Rust")
-            .with_inner_size(LogicalSize::new(1280, 720))
+            .with_title("Holographic City Viewer")
+            .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
             .build(&event_loop)?,
     );
 
-    let mut app = pollster::block_on(App::new(window.clone()));
+    // Block on async initialization
+    let mut app = pollster::block_on(App::new(window.clone()))?;
 
-    // Load all .hypc tiles found under ./hypc (or ../hypc)
-    if std::path::Path::new("hypc").exists() {
-        if let Err(e) = app.build_all_tiles("hypc") {
-            log::error!("Failed to build tiles from 'hypc': {}", e);
-        }
-    } else if std::path::Path::new("../hypc").exists() {
-        if let Err(e) = app.build_all_tiles("../hypc") {
-            log::error!("Failed to build tiles from '../hypc': {}", e);
-        }
+    // Load data
+    if let Err(e) = app.build_all_tiles("hypc") {
+        log::error!("Failed to build tiles: {}", e);
     }
 
+    // Run the event loop
     event_loop.run(move |event, elwt| {
-        elwt.set_control_flow(winit::event_loop::ControlFlow::Poll);
+        elwt.set_control_flow(ControlFlow::Poll);
 
         match event {
             Event::WindowEvent {
                 window_id,
                 event,
             } if window_id == window.id() => {
-                // Let egui consume events first, then pass to app
-                if !app.handle_event(&event) {
+                // Pass events to the app. If not consumed, handle window-level events.
+                if !app.handle_event(&window, &event) {
                     match event {
                         WindowEvent::CloseRequested => elwt.exit(),
                         WindowEvent::KeyboardInput { event, .. } => {
@@ -53,12 +52,14 @@ fn main() -> Result<()> {
                             }
                         }
                         WindowEvent::RedrawRequested => {
-                            if let Err(e) = app.render() {
-                                match e {
-                                    wgpu::SurfaceError::Lost => app.resize(app.get_size()),
-                                    wgpu::SurfaceError::OutOfMemory => elwt.exit(),
-                                    _ => eprintln!("Render error: {:?}", e),
+                            match app.render(&window) {
+                                Ok(_) => {}
+                                Err(wgpu::SurfaceError::Lost) => app.resize(app.renderer.gfx.size),
+                                Err(wgpu::SurfaceError::OutOfMemory) => {
+                                    log::error!("WGPU Out of Memory! Exiting.");
+                                    elwt.exit();
                                 }
+                                Err(e) => log::error!("Render error: {:?}", e),
                             }
                         }
                         _ => {}
@@ -66,12 +67,12 @@ fn main() -> Result<()> {
                 }
             }
             Event::AboutToWait => {
+                // Redraw continuously
                 window.request_redraw();
             }
             _ => {}
         }
     })?;
 
-    #[allow(unreachable_code)]
     Ok(())
 }
