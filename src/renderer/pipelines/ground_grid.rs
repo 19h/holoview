@@ -11,7 +11,12 @@ pub struct GridUniforms {
     pub model_view_proj: Mat4,
     /// Camera height above the tangent plane, meters.
     pub camera_height_m: f32,
-    pub _padding: [f32; 3],
+    pub _pad0: [f32; 3],
+    /// EN offset (meters) of this tangent plane relative to a fixed world anchor (dataset center).
+    pub enu_offset_m: [f32; 2],
+    /// Half‑extent (meters) used to scale the plane from NDC to world meters.
+    pub plane_extent_m: f32,
+    pub _pad1: [f32; 1],
 }
 
 pub struct GroundGridPipeline {
@@ -19,6 +24,8 @@ pub struct GroundGridPipeline {
     bind_group:     wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
     quad_vb:        wgpu::Buffer,
+    origin_ecef_m:  [f64; 3],   // dataset/world anchor
+    plane_extent_m: f32,        // meters from center to edge
 }
 
 impl GroundGridPipeline {
@@ -137,7 +144,14 @@ impl GroundGridPipeline {
             bind_group,
             uniform_buffer,
             quad_vb,
+            origin_ecef_m: [0.0; 3],
+            plane_extent_m: 500_000.0,
         }
+    }
+
+    /// Set the world anchor used to stabilize the grid in EN coordinates (meters).
+    pub fn set_origin(&mut self, ecef_m: [f64; 3]) {
+        self.origin_ecef_m = ecef_m;
     }
 
     pub fn draw<'a>(
@@ -152,25 +166,36 @@ impl GroundGridPipeline {
 
         // Camera relative position to tangent point
         let view_proj = camera.view_proj_ecef();
-        let view      = camera.view_ecef();
-
         let rel_pos = Vec3::new(
             (tangent_ecef[0] - cam_ecef[0]) as f32,
             (tangent_ecef[1] - cam_ecef[1]) as f32,
             (tangent_ecef[2] - cam_ecef[2]) as f32,
         );
 
-        // Extract rotation from pure view matrix
-        let (_scale, view_rot, _trans) = view.to_scale_rotation_translation();
+        // Build a model that aligns the plane with ENU (world), NOT the camera.
+        let r_ecef_to_enu = camera.ecef_to_enu_matrix();
+        let r_enu_to_ecef = r_ecef_to_enu.transpose(); // orthonormal inverse
         let model = Mat4::from_translation(rel_pos)
-            * Mat4::from_quat(view_rot.inverse())
-            * Mat4::from_scale(Vec3::splat(500_000.0));
+            * Mat4::from_mat3(r_enu_to_ecef)
+            * Mat4::from_scale(Vec3::splat(self.plane_extent_m));
+
+        // EN offset (meters) of this tangent plane relative to the world anchor.
+        let diff_anchor = Vec3::new(
+            (tangent_ecef[0] - self.origin_ecef_m[0]) as f32,
+            (tangent_ecef[1] - self.origin_ecef_m[1]) as f32,
+            (tangent_ecef[2] - self.origin_ecef_m[2]) as f32,
+        );
+        let diff_en = r_ecef_to_enu * diff_anchor; // meters in ENU
+        let enu_offset_m = [diff_en.x, diff_en.y];
 
         // Uniforms
         let uniforms = GridUniforms {
             model_view_proj: view_proj * model,
             camera_height_m: camera.h_m as f32,
-            _padding:       [0.0; 3],
+            _pad0:          [0.0; 3],
+            enu_offset_m,
+            plane_extent_m: self.plane_extent_m,
+            _pad1:          [0.0],
         };
 
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -187,19 +212,24 @@ pub const GRID_WGSL: &str = r#"
 struct GridUniforms {
     model_view_proj: mat4x4<f32>,
     camera_height_m: f32,
+    _pad0: vec3<f32>,
+    enu_offset_m: vec2<f32>,
+    plane_extent_m: f32,
+    _pad1: f32,
 };
 @group(0) @binding(0) var<uniform> U: GridUniforms;
 
 struct VSOut {
     @builtin(position) clip: vec4<f32>,
-    @location(0) world_pos: vec2<f32>,
+    @location(0) world_pos: vec2<f32>, // EN coordinates in meters (stable)
 }
 
 @vertex
 fn vs_main(@location(0) corner: vec2<f32>) -> VSOut {
     var out: VSOut;
     out.clip = U.model_view_proj * vec4<f32>(corner, 0.0, 1.0);
-    out.world_pos = corner * 500_000.0; // Pass position for grid calculation
+    // Convert NDC quad corners to EN meters and add the world-anchor offset.
+    out.world_pos = corner * U.plane_extent_m + U.enu_offset_m;
     return out;
 }
 
@@ -241,7 +271,7 @@ fn fs_main(in: VSOut) -> FSOut {
     let grid = mix(grid0, grid1, t);
 
     // Fade at extreme heights
-    let opacity = grid * (1.0 - smoothstep(20_000.0, 200_000.0, U.camera_height_m));
+    let opacity = grid * (1.0 - smoothstep(20000.0, 200000.0, U.camera_height_m));
     let color   = vec3<f32>(0.90, 0.15, 0.15);
 
     var out: FSOut;

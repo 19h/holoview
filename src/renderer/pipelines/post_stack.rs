@@ -153,10 +153,10 @@ impl Default for PostParams {
         Self {
             edl_strength: 1.4,
             edl_radius_px: 1.0,
-            sem_amount: 0.55,
+            sem_amount: 0.40,
             rgb_amount: 0.0025,
             rgb_angle: 0.9,
-            crt_intensity: 0.35,
+            crt_intensity: 0.25,
             crt_vignette: 0.8,
         }
     }

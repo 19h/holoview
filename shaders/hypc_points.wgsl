@@ -1,6 +1,6 @@
- // HYPC camera-relative point renderer with MRT and billboarding.
+ // HYPC camera‑relative point renderer with MRT and billboarding.
  // RT0: color (rgb = base, a = coverage alpha)
- // RT1: depth-linear proxy (r = z_ndc [0..1], g = semantic label / 255, a = tag)
+ // RT1: depth‑linear proxy (r = z_ndc [0..1], g = semantic label / 255, a = tag)
 
  struct TileUniform {
      delta_hi      : vec3<f32>,
@@ -24,21 +24,26 @@
 
  @vertex
  fn vs_main(
-     @location(0) corner : vec2<f32>, // From quad vertex buffer (step_mode = Vertex)
-     @location(1) ofs_m  : vec3<f32>, // From instance buffer (step_mode = Instance)
-     @location(2) label  : u32,       // From instance buffer (step_mode = Instance)
+     @location(0) corner : vec2<f32>, // Quad vertex buffer (step_mode = Vertex)
+     @location(1) ofs_m  : vec3<f32>, // Instance buffer (step_mode = Instance)
+     @location(2) label  : u32,       // Instance buffer (step_mode = Instance)
  ) -> VSOut {
      // 1. Reconstruct high‑precision camera‑relative position.
      let world_rel = (U.delta_hi + U.delta_lo) + ofs_m;
 
-     // 2. Project to clip space to find the center point.
+     // 2. Project to clip space to find the centre point.
      let clip_center = U.view_proj * vec4<f32>(world_rel, 1.0);
 
      // 3. Perform billboarding in clip space.
      // Convert point size from pixels to normalized device coordinates (NDC).
      let point_size_ndc = (U.point_size_px / U.viewport_size) * 2.0;
+
+     // Clamp the perspective scaling factor to be non-negative. This prevents
+     // billboards from inverting and exploding when behind the camera.
+     let perspective_scale = max(clip_center.w, 0.0);
+
      let offset = vec2<f32>(corner.x * point_size_ndc.x,
-                            corner.y * point_size_ndc.y) * clip_center.w;
+                            corner.y * point_size_ndc.y) * perspective_scale;
 
      var o : VSOut;
      o.clip     = vec4<f32>(clip_center.xy + offset, clip_center.z, clip_center.w);
@@ -52,11 +57,11 @@
  struct FSOut {
      @location(0) color : vec4<f32>,
      @location(1) dlin  : vec4<f32>,
- }
+ };
 
  fn base_color(_label : u32) -> vec3<f32> {
-     // Neutral gray; semantic tint happens in post.
-     return vec3<f32>(0.85, 0.85, 0.85);
+     // Slightly darker neutral; semantic tint happens in post.
+     return vec3<f32>(0.70, 0.70, 0.70);
  }
 
  @fragment
@@ -72,9 +77,9 @@
      // Color carries only coverage alpha (for blending‑based AA).
      out.color = vec4<f32>(base_color(in.label), alpha);
      // Depth‑linear proxy + semantic label + tag (1 = not grid).
-     out.dlin  = vec4<f32>(clamp(in.zndc, 0.0, 1.0),
-                          f32(in.label) / 255.0,
-                          0.0,
-                          1.0);
+     out.dlin = vec4<f32>(clamp(in.zndc, 0.0, 1.0),
+                         f32(in.label) / 255.0,
+                         0.0,
+                         1.0);
      return out;
  }

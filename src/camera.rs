@@ -40,7 +40,7 @@ impl Camera {
     }
 
     /// Returns rotation matrix from ECEF to ENU for the camera position.
-    fn ecef_to_enu_matrix(&self) -> Mat3 {
+    pub fn ecef_to_enu_matrix(&self) -> Mat3 {
         let lat_rad = self.lat_deg.to_radians();
         let lon_rad = self.lon_deg.to_radians();
         let (sin_lat, cos_lat) = lat_rad.sin_cos();
@@ -157,7 +157,8 @@ impl CameraController {
 
     /// Adjusts camera altitude based on scroll input.
     fn handle_scroll(&mut self, delta: f32, camera: &mut Camera) {
-        let zoom = 1.1_f64.powf(-delta as f64);
+        // Positive delta = scroll up. Make this increase altitude (feel free to flip if preferred).
+        let zoom = 1.1_f64.powf(delta as f64);
 
         camera.h_m *= zoom;
         camera.h_m = camera.h_m.clamp(10.0, 1_000_000.0);

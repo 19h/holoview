@@ -198,6 +198,9 @@ impl App {
             let start_alt_m = (radius_m * 1.2).clamp(50.0, 50_000.0);
             self.camera.h_m = start_alt_m;
 
+            // Propagate grid world anchor so the grid is stable in EN.
+            self.renderer.grid.set_origin(center_ecef_m);
+
             log::info!(
                 "Loaded {} tiles | points={} | UPM range [{}..{}].",
                 loaded_tiles.len(), total_points, min_upm, max_upm
