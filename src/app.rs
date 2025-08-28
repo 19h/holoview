@@ -257,11 +257,13 @@ impl App {
             total_points,
         );
 
-        ui::draw_debug_panel(
-            &self.egui_ctx,
-            &mut self.renderer.post_stack.params,
-            &mut self.point_size,
-        );
+        if true {
+            ui::draw_debug_panel(
+                &self.egui_ctx,
+                &mut self.renderer.post_stack.params,
+                &mut self.point_size,
+            );
+        }
 
         let egui_output = self.egui_ctx.end_frame();
         let shapes = self

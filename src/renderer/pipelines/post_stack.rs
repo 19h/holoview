@@ -11,6 +11,30 @@ const FS_TRI: [[f32; 2]; 3] = [
     [-1.0, 3.0],
 ];
 
+/// WGSL shader for a simple texture blit/passthrough.
+const BLIT_WGSL: &str = r#"
+struct VSOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0)         uv: vec2<f32>,
+}
+
+@vertex
+fn vs_main(@location(0) pos: vec2<f32>) -> VSOut {
+    var out: VSOut;
+    out.clip = vec4<f32>(pos, 0.0, 1.0);
+    out.uv = vec2<f32>(0.5 * (pos.x + 1.0), 0.5 * (-pos.y + 1.0));
+    return out;
+}
+
+@group(0) @binding(0) var tSrc: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+@fragment
+fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+    return textureSampleLevel(tSrc, samp, in.uv, 0.0);
+}
+"#;
+
 /// Ping‑pong textures for multi‑pass rendering
 pub struct PingPong {
     pub ping: wgpu::TextureView,
@@ -151,6 +175,13 @@ struct DebugPass {
     fs_vbo: wgpu::Buffer,
 }
 
+struct BlitPass {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    fs_vbo: wgpu::Buffer,
+}
+
 // -------------------- Post Parameters & Stack --------------------
 
 #[derive(Clone, Copy, Debug)]
@@ -182,10 +213,10 @@ impl Default for PostParams {
         Self {
             edl_strength: 1.4,
             edl_radius_px: 1.0,
-            sem_amount: 0.40,
-            rgb_amount: 0.0025,
-            rgb_angle: 0.9,
-            crt_intensity: 0.25,
+            sem_amount: 0.80,
+            rgb_amount: 0.0007,
+            rgb_angle: 1.4,
+            crt_intensity: 1.0,
             crt_vignette: 0.8,
 
             edl_on:  true,
@@ -205,6 +236,7 @@ pub struct PostStack {
     sem: SemPost,
     rgb: RgbShiftPass,
     crt: CrtPass,
+    blit: BlitPass,
     dbg: DebugPass,
     pub params: PostParams,
     start: Instant,
@@ -222,13 +254,17 @@ impl PostStack {
         let sem = SemPost::new(device, INTERMEDIATE_FMT);
         let rgb = RgbShiftPass::new(device, INTERMEDIATE_FMT);
         let crt = CrtPass::new(device, out_fmt);
+        let blit = BlitPass::new(device, out_fmt);
+        let dbg = DebugPass::new(device, out_fmt);
+
         Self {
             pingpong,
             edl,
             sem,
             rgb,
             crt,
-            dbg: DebugPass::new(device, out_fmt),
+            blit,
+            dbg,
             params: PostParams::default(),
             start: Instant::now(),
         }
@@ -253,77 +289,84 @@ impl PostStack {
         let inv_size = [1.0 / width, 1.0 / height];
         let time = self.start.elapsed().as_secs_f32();
 
-        // Current source pointer
-        let mut src = scene_color_src;
+        // --- Robust Ping-Pong Logic ---
+        // `source` always holds the result of the last pass.
+        // `targets` holds the pair of intermediate textures to alternate between.
+        let mut source = scene_color_src;
+        let mut targets = (&self.pingpong.ping, &self.pingpong.pong);
 
-        // Enhanced Depth Linearity pass
+        // Pass 1: Eye-Dome Lighting
         if self.params.edl_on {
             self.edl.draw(
                 device,
                 queue,
                 encoder,
-                &self.pingpong.ping,
-                src,
+                targets.0, // Dst
+                source,    // Src
                 depthlin,
                 inv_size,
                 self.params.edl_strength,
                 self.params.edl_radius_px,
             );
-            src = &self.pingpong.ping;
+            source = targets.0;
+            std::mem::swap(&mut targets.0, &mut targets.1);
         }
 
-        // Semantic overlay pass
+        // Pass 2: Semantic Coloring
         if self.params.sem_on {
             self.sem.draw(
                 device,
                 queue,
                 encoder,
-                &self.pingpong.pong,
-                src,
+                targets.0, // Dst
+                source,    // Src
                 depthlin,
                 self.params.sem_amount,
             );
-            src = &self.pingpong.pong;
+            source = targets.0;
+            std::mem::swap(&mut targets.0, &mut targets.1);
         }
 
-        // RGB shift pass
+        // Pass 3: RGB Shift
         if self.params.rgb_on {
             self.rgb.draw(
                 device,
                 queue,
                 encoder,
-                &self.pingpong.ping,
-                src,
+                targets.0, // Dst
+                source,    // Src
                 depthlin,
                 inv_size,
                 self.params.rgb_amount,
                 self.params.rgb_angle,
             );
-            src = &self.pingpong.ping;
+            source = targets.0;
+            // No swap needed after the last intermediate pass
         }
 
-        // Debug visualization, if requested
+        // --- Final Output ---
+        // Debug visualization overrides all other final passes.
         if self.params.debug_mode != 0 {
             self.dbg.draw(
                 device,
                 queue,
                 encoder,
                 swapchain_dst,
-                src,
+                source,
                 depthlin,
                 self.params.debug_mode,
             );
             return;
         }
 
-        // CRT emulation pass (final output)
+        // If CRT is on, it's the final pass. Otherwise, blit the last result.
         if self.params.crt_on {
             self.crt.draw(
                 device,
                 queue,
                 encoder,
                 swapchain_dst,
-                src,
+                source,
                 depthlin,
                 inv_size,
                 time,
@@ -331,18 +374,7 @@ impl PostStack {
                 self.params.crt_vignette,
             );
         } else {
-            // Identity copy using RGB pass with zero amount
-            self.rgb.draw(
-                device,
-                queue,
-                encoder,
-                swapchain_dst,
-                src,
-                depthlin,
-                inv_size,
-                0.0,
-                0.0,
-            );
+            self.blit.draw(device, encoder, swapchain_dst, source);
         }
     }
 }
@@ -747,5 +779,119 @@ impl DebugPass {
         });
 
         execute_pass(&self.pipeline, encoder, &bind, &self.fs_vbo, dst, "DebugVis Pass");
+    }
+}
+
+impl BlitPass {
+    pub fn new(device: &wgpu::Device, out_fmt: wgpu::TextureFormat) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("BlitPass Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
+        });
+
+        let pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("BlitPass PipelineLayout"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("BlitPass Pipeline"),
+            layout: Some(&pipe_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<[f32; 2]>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
+                        shader_location: 0,
+                        offset: 0,
+                        format: wgpu::VertexFormat::Float32x2,
+                    }],
+                }],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: out_fmt,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("BlitPass Sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let fs_vbo = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("BlitPass FS VBO"),
+            contents: bytemuck::cast_slice(&FS_TRI),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        Self {
+            pipeline,
+            layout,
+            sampler,
+            fs_vbo,
+        }
+    }
+
+    pub fn draw(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &wgpu::TextureView,
+        t_src: &wgpu::TextureView,
+    ) {
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blit Bind"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(t_src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        execute_pass(&self.pipeline, encoder, &bind, &self.fs_vbo, dst, "Blit Pass");
     }
 }

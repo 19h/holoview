@@ -1,7 +1,8 @@
+// holographic-viewer/src/ui.rs
 //! UI rendering using egui.
 
-use egui::{Area, Frame, RichText};
 use crate::renderer::pipelines::post_stack::PostParams;
+use egui::{Area, Frame, RichText};
 
 /// Draws the HUD overlay, including corner brackets and status text.
 pub fn draw_hud(egui_ctx: &egui::Context, altitude: i32, total_points: u32) {
@@ -12,8 +13,8 @@ pub fn draw_hud(egui_ctx: &egui::Context, altitude: i32, total_points: u32) {
             egui::Id::new("hud_lines"),
         ));
 
-        let rect   = egui_ctx.screen_rect();
-        let color  = egui::Color32::from_rgba_unmultiplied(45, 247, 255, 200);
+        let rect = egui_ctx.screen_rect();
+        let color = egui::Color32::from_rgba_unmultiplied(45, 247, 255, 200);
         let (thickness, margin, length) = (2.0, 26.0, 140.0);
 
         // Top‑left bracket
@@ -121,18 +122,78 @@ pub fn draw_debug_panel(egui_ctx: &egui::Context, params: &mut PostParams, point
         .fixed_pos(egui::pos2(40.0, 140.0))
         .show(egui_ctx, |ui| {
             Frame::dark_canvas(ui.style()).show(ui, |ui| {
-                ui.heading("Debug");
+                let defaults = PostParams::default();
+                const DEFAULT_POINT_SIZE: f32 = 4.0;
+
+                ui.horizontal(|ui| {
+                    ui.heading("Debug");
+                    if ui.button("Reset All").clicked() {
+                        *params = defaults;
+                        *point_size = DEFAULT_POINT_SIZE;
+                    }
+                });
+
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut params.grid_on, "Grid");
-                    ui.checkbox(&mut params.edl_on,  "EDL");
-                    ui.checkbox(&mut params.sem_on,  "Semantic");
-                    ui.checkbox(&mut params.rgb_on,  "RGB shift");
-                    ui.checkbox(&mut params.crt_on,  "CRT");
+                    ui.checkbox(&mut params.edl_on, "EDL");
+                    ui.checkbox(&mut params.sem_on, "Semantic");
+                    ui.checkbox(&mut params.rgb_on, "RGB shift");
+                    ui.checkbox(&mut params.crt_on, "CRT");
                 });
                 ui.separator();
                 ui.label("Point size (px)");
                 ui.add(egui::Slider::new(point_size, 1.0..=12.0));
                 ui.separator();
+
+                ui.collapsing("EDL", |ui| {
+                    if ui.button("Reset").clicked() {
+                        params.edl_strength = defaults.edl_strength;
+                        params.edl_radius_px = defaults.edl_radius_px;
+                    }
+                    ui.separator();
+                    ui.label("Strength");
+                    ui.add(egui::Slider::new(&mut params.edl_strength, 0.0..=5.0));
+                    ui.label("Radius (px)");
+                    ui.add(egui::Slider::new(&mut params.edl_radius_px, 0.5..=4.0));
+                });
+
+                ui.collapsing("Semantic", |ui| {
+                    if ui.button("Reset").clicked() {
+                        params.sem_amount = defaults.sem_amount;
+                    }
+                    ui.separator();
+                    ui.label("Amount");
+                    ui.add(egui::Slider::new(&mut params.sem_amount, 0.0..=1.0));
+                });
+
+                ui.collapsing("RGB Shift", |ui| {
+                    if ui.button("Reset").clicked() {
+                        params.rgb_amount = defaults.rgb_amount;
+                        params.rgb_angle = defaults.rgb_angle;
+                    }
+                    ui.separator();
+                    ui.label("Amount");
+                    ui.add(egui::Slider::new(&mut params.rgb_amount, 0.0..=0.01));
+                    ui.label("Angle");
+                    ui.add(egui::Slider::new(
+                        &mut params.rgb_angle,
+                        0.0..=std::f32::consts::TAU,
+                    ));
+                });
+
+                ui.collapsing("CRT", |ui| {
+                    if ui.button("Reset").clicked() {
+                        params.crt_intensity = defaults.crt_intensity;
+                        params.crt_vignette = defaults.crt_vignette;
+                    }
+                    ui.separator();
+                    ui.label("Intensity");
+                    ui.add(egui::Slider::new(&mut params.crt_intensity, 0.0..=1.0));
+                    ui.label("Vignette");
+                    ui.add(egui::Slider::new(&mut params.crt_vignette, 0.0..=1.0));
+                });
+                ui.separator();
+
                 ui.label("Debug View");
                 ui.radio_value(&mut params.debug_mode, 0, "Off");
                 ui.radio_value(&mut params.debug_mode, 1, "Depth");
