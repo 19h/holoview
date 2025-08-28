@@ -211,26 +211,17 @@ pub fn parse_hypc_bytes(mut p: &[u8]) -> io::Result<HypcTile> {
     need(p, pts_bytes)?;
 
     let (points_units, labels): (Vec<[i32; 3]>, Option<Vec<u8>>) = if has_labels {
-        // Single pass decode of interleaved [i32 i32 i32 u8] records.
+        // Safe, simple decode of interleaved [i32; 3] and u8 records.
+        // This replaces a previous `unsafe` implementation that was a source of bugs.
         let mut pts = Vec::<[i32; 3]>::with_capacity(count);
         let mut ls  = Vec::<u8>::with_capacity(count);
-        unsafe {
-            pts.set_len(count);
-        } // we'll write every slot exactly once
 
-        for i in 0..count {
-            // Read 12 bytes of i32s
+        for _ in 0..count {
             let dx = le_i32(&mut p)?;
             let dy = le_i32(&mut p)?;
             let dz = le_i32(&mut p)?;
-
-            // Label
             let l = le_u8(&mut p)?;
-
-            // Write (avoids bounds checks)
-            unsafe {
-                *pts.get_unchecked_mut(i) = [dx, dy, dz];
-            }
+            pts.push([dx, dy, dz]);
             ls.push(l);
         }
 
