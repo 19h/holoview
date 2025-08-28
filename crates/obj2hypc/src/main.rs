@@ -884,12 +884,16 @@ fn clamp_i(v: i32, lo: i32, hi: i32) -> i32 {
     v.max(lo).min(hi)
 }
 
+/// Convert normalized UV coordinates (0.0 to 1.0) to pixel coordinates.
 #[inline]
 fn uv_to_pixel(u: f32, v: f32, w: u16, h: u16) -> (i32, i32) {
-    (
-        (u * w as f32).round() as i32,
-        (v * h as f32).round() as i32,
-    )
+    let u_clamped = u.clamp(0.0, 1.0);
+    let v_clamped = v.clamp(0.0, 1.0);
+
+    let x = (u_clamped * (w as f32 - 1.0)).round() as i32;
+    let y = (v_clamped * (h as f32 - 1.0)).round() as i32;
+
+    (x, y)
 }
 
 fn paint_pixel(mask: &mut SemMask, x: i32, y: i32, class: u8) {
@@ -1298,6 +1302,8 @@ fn process_one_mesh(
     bbox: Option<GeoBboxDeg>,
     overlays: Option<&SemOverlayPerTile>,
 ) -> Result<()> {
+    use log::debug;
+
     // ---------------------------------------------------------------------
     // Output path handling
     // ---------------------------------------------------------------------
@@ -1310,6 +1316,7 @@ fn process_one_mesh(
     ));
 
     if out_path.exists() && !args.overwrite {
+        debug!("Skipping existing file: {}", out_path.display());
         return Ok(());
     }
 
@@ -1318,16 +1325,24 @@ fn process_one_mesh(
     // ---------------------------------------------------------------------
     // Load raw OBJ vertices (supports plain .obj or .zip containing a single .obj)
     // ---------------------------------------------------------------------
+    debug!("Loading vertices from {}", path.display());
     let raw_xyz: Vec<[f64; 3]> = if path.extension().and_then(|s| s.to_str()) == Some("zip") {
+        debug!("Opening ZIP archive");
         let file = File::open(path)?;
+
         let mut archive = zip::ZipArchive::new(file)?;
+
         let obj_name = archive
             .file_names()
             .find(|n| n.to_ascii_lowercase().ends_with(".obj"))
-            .context("No .obj file found in zip archive")?;
-        let mut obj_file = archive.by_name(obj_name)?;
+            .context("No .obj file found in zip archive")?.to_owned();
+
+        debug!("Found OBJ file in ZIP: {}", obj_name);
+        let mut obj_file = archive.by_name(&obj_name)?;
+
         parse_obj_vertices(&mut obj_file)?
     } else {
+        debug!("Opening OBJ file directly");
         parse_obj_vertices(File::open(path)?)?
     };
 
@@ -1336,17 +1351,22 @@ fn process_one_mesh(
         return Ok(());
     }
 
+    debug!("Loaded {} raw vertices", raw_xyz.len());
+
     // ---------------------------------------------------------------------
     // Determine coordinate system (auto‑detect if requested)
     // ---------------------------------------------------------------------
     let cs = match args.input_cs {
         InputCs::Auto => {
+            debug!("Auto-detecting coordinate system from {} sample vertices", raw_xyz.len().min(4096));
             let sample_len = raw_xyz.len().min(4096);
             let guess = detect_input_cs(&raw_xyz[..sample_len]);
+
             info!("Input CS (auto‑detected): {guess}");
             guess
         }
         forced => {
+            debug!("Using forced coordinate system: {forced}");
             info!("Input CS (forced): {forced}");
             forced
         }
@@ -1355,6 +1375,7 @@ fn process_one_mesh(
     // ---------------------------------------------------------------------
     // Convert vertices to ECEF metres and optionally track lon/lat bounds
     // ---------------------------------------------------------------------
+    debug!("Converting {} vertices from {:?} to ECEF", raw_xyz.len(), cs);
     let mut points_m = Vec::with_capacity(raw_xyz.len());
     let mut lon_min = f64::INFINITY;
     let mut lon_max = f64::NEG_INFINITY;
@@ -1363,6 +1384,7 @@ fn process_one_mesh(
 
     match cs {
         InputCs::Geodetic => {
+            debug!("Processing {} geodetic coordinates (lon, lat, height)", raw_xyz.len());
             for &[lon, lat, h_m] in &raw_xyz {
                 lon_min = lon_min.min(lon);
                 lon_max = lon_max.max(lon);
@@ -1370,38 +1392,90 @@ fn process_one_mesh(
                 lat_max = lat_max.max(lat);
                 points_m.push(geodetic_to_ecef(lat, lon, h_m));
             }
+            debug!("Geodetic bounds: lon=[{:.6}, {:.6}], lat=[{:.6}, {:.6}]", lon_min, lon_max, lat_min, lat_max);
+            debug!("Height range: [{:.3}, {:.3}]m",
+                   raw_xyz.iter().map(|p| p[2]).fold(f64::INFINITY, f64::min),
+                   raw_xyz.iter().map(|p| p[2]).fold(f64::NEG_INFINITY, f64::max));
         }
         InputCs::Ecef => {
+            debug!("Using {} ECEF coordinates directly", raw_xyz.len());
             points_m.extend(raw_xyz.iter().copied());
+
+            // Calculate some basic statistics for debugging
+            let (mut min_x, mut max_x) = (f64::INFINITY, f64::NEG_INFINITY);
+            let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+            let (mut min_z, mut max_z) = (f64::INFINITY, f64::NEG_INFINITY);
+            for &[x, y, z] in &raw_xyz {
+                min_x = min_x.min(x); max_x = max_x.max(x);
+                min_y = min_y.min(y); max_y = max_y.max(y);
+                min_z = min_z.min(z); max_z = max_z.max(z);
+            }
+            debug!("ECEF bounds: X=[{:.1}, {:.1}], Y=[{:.1}, {:.1}], Z=[{:.1}, {:.1}]m",
+                   min_x, max_x, min_y, max_y, min_z, max_z);
         }
         InputCs::LocalM => {
+            debug!("Converting {} local ENU coordinates to ECEF", raw_xyz.len());
+
             // Local ENU coordinates – requires a geographic bounding box.
             let bbox =
                 bbox.context("LocalM coordinate system needs a bbox (provide --feature-index)")?;
+
+            debug!("Using tile bbox: lon=[{:.6}, {:.6}], lat=[{:.6}, {:.6}]",
+                   bbox.lon_min, bbox.lon_max, bbox.lat_min, bbox.lat_max);
 
             // Geographic centre of the tile.
             let lat_c = (bbox.lat_min + bbox.lat_max) * 0.5;
             let lon_c = (bbox.lon_min + bbox.lon_max) * 0.5;
 
+            // Calculate local coordinate bounds for debugging
+            let (mut min_x, mut max_x) = (f64::INFINITY, f64::NEG_INFINITY);
+            let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+            let (mut min_z, mut max_z) = (f64::INFINITY, f64::NEG_INFINITY);
+            for &[x, y, z] in &raw_xyz {
+                min_x = min_x.min(x); max_x = max_x.max(x);
+                min_y = min_y.min(y); max_y = max_y.max(y);
+                min_z = min_z.min(z); max_z = max_z.max(z);
+            }
+
             // Robust anchor height: median Z value of the vertices.
             let mut heights: Vec<f64> = raw_xyz.iter().map(|p| p[2]).collect();
             let median_idx = heights.len() / 2;
-            heights.select_nth_unstable(median_idx);
+
+            heights.select_nth_unstable_by(median_idx, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
             let anchor_h = heights[median_idx];
+
+            // Derive a planar origin so large UTM-like values become small offsets
+            let e0 = 0.5 * (min_x + max_x);
+            let n0 = 0.5 * (min_y + max_y);
+
+            debug!(
+                "Local origin (E0,N0,U0)=({:.2}, {:.2}, {:.2}) m",
+                e0, n0, anchor_h
+            );
 
             // ECEF centre of the tile at the median height.
             let ecef_center = geodetic_to_ecef(lat_c, lon_c, anchor_h);
+            debug!("ECEF anchor point: [{:.1}, {:.1}, {:.1}]", ecef_center[0], ecef_center[1], ecef_center[2]);
+
             // ENU basis vectors at the centre point.
             let (enu_e, enu_n, enu_u) = enu_basis(lat_c, lon_c);
+            debug!("ENU basis vectors computed for lat={:.6}, lon={:.6}", lat_c, lon_c);
 
-            // Transform each ENU vertex to ECEF.
+            // Transform *offset* ENU coords to ECEF
             for &[x_e, y_n, z_u] in &raw_xyz {
-                let x = ecef_center[0] + x_e * enu_e[0] + y_n * enu_n[0] + z_u * enu_u[0];
-                let y = ecef_center[1] + x_e * enu_e[1] + y_n * enu_n[1] + z_u * enu_u[1];
-                let z = ecef_center[2] + x_e * enu_e[2] + y_n * enu_n[2] + z_u * enu_u[2];
+                let xe = x_e - e0;         // subtract planar origin
+                let yn = y_n - n0;
+                let zu = z_u - anchor_h;   // remove absolute height baseline
+
+                let x = ecef_center[0] + xe * enu_e[0] + yn * enu_n[0] + zu * enu_u[0];
+                let y = ecef_center[1] + xe * enu_e[1] + yn * enu_n[1] + zu * enu_u[1];
+                let z = ecef_center[2] + xe * enu_e[2] + yn * enu_n[2] + zu * enu_u[2];
 
                 points_m.push([x, y, z]);
             }
+
+            debug!("Successfully transformed {} ENU coordinates to ECEF", raw_xyz.len());
         }
         InputCs::Auto => unreachable!(),
     }
@@ -1409,17 +1483,31 @@ fn process_one_mesh(
     // ---------------------------------------------------------------------
     // Quantize coordinates with a safe units‑per‑meter value.
     // ---------------------------------------------------------------------
+    debug!("Quantizing with requested units_per_meter: {}", args.units_per_meter);
     let q = quantize_with_anchor(&points_m, args.units_per_meter);
+
+    if q.used_upm != args.units_per_meter {
+        debug!("Quantization used reduced units_per_meter: {} -> {}", args.units_per_meter, q.used_upm);
+    }
+    debug!("Quantized {} points with anchor: [{}, {}, {}]",
+           q.points_units.len(), q.anchor_units[0], q.anchor_units[1], q.anchor_units[2]);
 
     // ---------------------------------------------------------------------
     // Optional SMC1 semantic mask
     // ---------------------------------------------------------------------
     let smc1_opt = if args.write_smc1 {
         if let (Some(bb), Some(ov)) = (bbox, overlays) {
+            debug!("Building SMC1 semantic mask {}x{} with {} roads, {} areas",
+                   args.sem_grid, args.sem_grid, ov.roads.len(), ov.areas.len());
             let mask = build_smc1_mask(ov, bb, args.sem_grid);
             let (encoding, data) = if args.smc1_compress {
-                (Smc1Encoding::Rle, smc1_encode_rle(&mask.data))
+                let compressed = smc1_encode_rle(&mask.data);
+                debug!("SMC1 RLE compression: {} -> {} bytes ({:.1}%)",
+                       mask.data.len(), compressed.len(),
+                       (compressed.len() as f64 / mask.data.len() as f64) * 100.0);
+                (Smc1Encoding::Rle, compressed)
             } else {
+                debug!("SMC1 using raw encoding: {} bytes", mask.data.len());
                 (Smc1Encoding::Raw, mask.data)
             };
 
@@ -1434,9 +1522,11 @@ fn process_one_mesh(
                     .collect(),
             })
         } else {
+            debug!("SMC1 requested but no bbox or overlays available");
             None
         }
     } else {
+        debug!("SMC1 semantic mask generation disabled");
         None
     };
 
@@ -1445,6 +1535,8 @@ fn process_one_mesh(
     // ---------------------------------------------------------------------
     let geot = if args.write_geot {
         if let Some(bb) = bbox {
+            debug!("Using GEOT from bbox: lon=[{:.6}, {:.6}], lat=[{:.6}, {:.6}]",
+                   bb.lon_min, bb.lon_max, bb.lat_min, bb.lat_max);
             Some(GeoExtentQ7::from_deg(
                 bb.lon_min,
                 bb.lon_max,
@@ -1457,11 +1549,15 @@ fn process_one_mesh(
             && lat_min.is_finite()
             && lat_max.is_finite()
         {
+            debug!("Using GEOT from computed bounds: lon=[{:.6}, {:.6}], lat=[{:.6}, {:.6}]",
+                   lon_min, lon_max, lat_min, lat_max);
             Some(GeoExtentQ7::from_deg(lon_min, lon_max, lat_min, lat_max))
         } else {
+            debug!("No GEOT information available");
             None
         }
     } else {
+        debug!("GEOT generation disabled");
         None
     };
 
@@ -1478,6 +1574,7 @@ fn process_one_mesh(
         smc1: smc1_opt,
     };
 
+    debug!("Writing HYPC tile to {}", out_path.display());
     hypc::write_file(&out_path, &tile)?;
 
     info!(
