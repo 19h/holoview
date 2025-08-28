@@ -3,9 +3,16 @@ name = "hypc"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Reader/writer for HPC1 point clouds with SMC1 and GEOT chunks."
+description = "Reader/writer for HYPC tiles (ECEF anchor + i32 offsets) with GEOT/SMC1 chunks."
 readme = "readme.md"
+
+[features]
+# Enable memory-mapped IO for read_file
+mmap = ["memmap2"]
 
 [dependencies]
 anyhow = "1.0"
+# miniz_oxide only needed if you add zlib variants later; keep or remove.
 miniz_oxide = "0.8.9"
+bytemuck = { version = "1.23" }
+memmap2 = { version = "0.9", optional = true }
