@@ -35,7 +35,6 @@ pub struct App {
     pub egui_ctx: egui::Context,
     pub egui_state: egui_winit::State,
     pub tiles: Vec<TileGpu>,
-    pub point_size: f32,
 }
 
 impl App {
@@ -51,7 +50,7 @@ impl App {
             20_000_000.0,
         );
 
-        // Default camera position (e.g., over San Francisco)
+        // Default camera, orbiting a point over Berlin at a 5km radius.
         let camera = Camera::new(52.52, 13.40, 5000.0, proj);
         let camera_controller = CameraController::new();
 
@@ -71,7 +70,6 @@ impl App {
             egui_ctx,
             egui_state,
             tiles: Vec::new(),
-            point_size: 1.0,
         })
     }
 
@@ -122,8 +120,8 @@ impl App {
 
         let mut loaded_tiles = Vec::new();
         let mut total_points: u64 = 0;
-        let mut sum_anchor_w = [0.0f64; 3];   // Σ (anchor_m * weight)
-        let mut sum_w = 0.0f64;               // Σ weight
+        let mut sum_anchor_w = [0.0f64; 3]; // Σ (anchor_m * weight)
+        let mut sum_w = 0.0f64; // Σ weight
         let mut anchors_m: Vec<[f64; 3]> = Vec::new();
         let mut min_upm: u32 = u32::MAX;
         let mut max_upm: u32 = 0;
@@ -168,9 +166,12 @@ impl App {
 
                     log::debug!(
                         "Tile {:?}: upm={}, anchor_ecef_m=({:.3},{:.3},{:.3}), points={}",
-                        tile.key.map(|k| String::from_utf8_lossy(&k).trim_end_matches('\0').to_string()),
+                        tile.key
+                            .map(|k| String::from_utf8_lossy(&k).trim_end_matches('\0').to_string()),
                         tile.units_per_meter,
-                        a_m[0], a_m[1], a_m[2],
+                        a_m[0],
+                        a_m[1],
+                        a_m[2],
                         tile.instances_len
                     );
 
@@ -191,24 +192,15 @@ impl App {
             ];
 
             // Plausibility check for WGS‑84 ECEF surface vicinity
-            let r = (center_ecef_m[0]*center_ecef_m[0]
-                   + center_ecef_m[1]*center_ecef_m[1]
-                   + center_ecef_m[2]*center_ecef_m[2]).sqrt();
+            let r = (center_ecef_m[0] * center_ecef_m[0]
+                + center_ecef_m[1] * center_ecef_m[1]
+                + center_ecef_m[2] * center_ecef_m[2])
+                .sqrt();
 
             // Accept only ~6.2–6.5 Mm (allows terrain + a few km)
             let plausible = (6_200_000.0..=6_500_000.0).contains(&r);
 
-            let mut lat_opt = None;
-            let mut lon_opt = None;
-
-            if plausible {
-                let (lat, lon, _h) = hypc::ecef_to_geodetic(
-                    center_ecef_m[0], center_ecef_m[1], center_ecef_m[2]);
-                self.camera.lat_deg = lat;
-                self.camera.lon_deg = lon;
-                lat_opt = Some(lat);
-                lon_opt = Some(lon);
-            } else {
+            if !plausible {
                 log::warn!(
                     "Anchor centroid radius {:.3} Mm not plausible for WGS‑84; skipping recenter. \
                      (Check input CS and HYPC anchors.)",
@@ -218,43 +210,47 @@ impl App {
 
             // Approximate dataset radius from anchor spread
             let mut r2_max = 0.0f64;
-
             for a in &anchors_m {
                 let dx = a[0] - center_ecef_m[0];
                 let dy = a[1] - center_ecef_m[1];
                 let dz = a[2] - center_ecef_m[2];
-                r2_max = r2_max.max(dx*dx + dy*dy + dz*dz);
+                r2_max = r2_max.max(dx * dx + dy * dy + dz * dz);
             }
-
             let radius_m = r2_max.sqrt();
 
-            // Choose a conservative starting altitude
-            let start_alt_m = (radius_m * 1.2).clamp(50.0, 50_000.0);
-            self.camera.h_m = start_alt_m;
+            // Choose a starting orbit radius to fit the dataset in view from an angle.
+            let start_radius_m = (radius_m * 2.0).clamp(100.0, 50_000.0);
+
+            if plausible {
+                self.camera
+                    .set_target_and_radius(center_ecef_m, start_radius_m);
+            }
 
             // Propagate grid world anchor so the grid is stable in EN.
             self.renderer.grid.set_origin(center_ecef_m);
 
             log::info!(
                 "Loaded {} tiles | points={} | UPM range [{}..{}].",
-                loaded_tiles.len(), total_points, min_upm, max_upm
+                loaded_tiles.len(),
+                total_points,
+                min_upm,
+                max_upm
             );
 
-            if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
-                log::info!(
-                    "Dataset center ECEF(m)=({:.3},{:.3},{:.3}) -> geodetic ({:.6}°, {:.6}°). \
-                     Anchor spread radius ~{:.1} m. Start altitude set to {:.1} m.",
-                    center_ecef_m[0], center_ecef_m[1], center_ecef_m[2],
-                    lat, lon, radius_m, start_alt_m
-                );
-            } else {
-                log::info!(
-                    "Dataset center ECEF(m)=({:.3},{:.3},{:.3}). \
-                     Anchor spread radius ~{:.1} m. Start altitude set to {:.1} m.",
-                    center_ecef_m[0], center_ecef_m[1], center_ecef_m[2],
-                    radius_m, start_alt_m
-                );
-            }
+            let (lat, lon, _) =
+                hypc::ecef_to_geodetic(center_ecef_m[0], center_ecef_m[1], center_ecef_m[2]);
+
+            log::info!(
+                "Dataset center ECEF(m)=({:.3},{:.3},{:.3}) -> geodetic ({:.6}°, {:.6}°). \
+                 Anchor spread radius ~{:.1} m. Start orbit radius set to {:.1} m.",
+                center_ecef_m[0],
+                center_ecef_m[1],
+                center_ecef_m[2],
+                lat,
+                lon,
+                radius_m,
+                start_radius_m
+            );
         }
 
         self.tiles = loaded_tiles;
@@ -272,8 +268,23 @@ impl App {
             self.renderer.gfx.size.height as f32,
         ];
 
+        // Dynamically adjust point size based on altitude - larger points at lower altitudes
+        const MAX_POINT_SIZE: f32 = 3.0;
+        const MIN_POINT_SIZE: f32 = 0.6;
+        const MAX_ALT_M: f32 = 1000.0;
+        let clamped_alt = (self.camera.h_m as f32).clamp(1.0, MAX_ALT_M);
+
+        // Normalize altitude to [0, 1] where 1.0 is max altitude
+        let normalized_alt = (clamped_alt.ln() / MAX_ALT_M.ln()).clamp(0.0, 1.0);
+
+        // Inverse relationship: point size decreases as altitude increases
+        // At normalized_alt = 0 (low altitude), point_size = MAX_POINT_SIZE
+        // At normalized_alt = 1 (high altitude), point_size = MIN_POINT_SIZE
+        let point_size = MAX_POINT_SIZE - normalized_alt * (MAX_POINT_SIZE - MIN_POINT_SIZE);
+
         for tile in &self.tiles {
-            let ubo_data = tile.make_uniform(&self.camera, viewport_size, self.point_size);
+            let ubo_data = tile.make_uniform(&self.camera, viewport_size, point_size);
+
             self.renderer
                 .gfx
                 .queue
@@ -286,11 +297,7 @@ impl App {
         let egui_input = self.egui_state.take_egui_input(window);
         self.egui_ctx.begin_frame(egui_input);
 
-        ui::draw_hud(
-            &self.egui_ctx,
-            self.camera.h_m as i32,
-            total_points,
-        );
+        ui::draw_hud(&self.egui_ctx, self.camera.h_m as i32, total_points);
 
         if true {
             let gamma_deg =
@@ -299,7 +306,6 @@ impl App {
             ui::draw_debug_panel(
                 &self.egui_ctx,
                 &mut self.renderer.post_stack.params,
-                &mut self.point_size,
                 gamma_deg,
             );
         }
@@ -310,7 +316,10 @@ impl App {
             .tessellate(egui_output.shapes, self.egui_ctx.pixels_per_point());
 
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [self.renderer.gfx.config.width, self.renderer.gfx.config.height],
+            size_in_pixels: [
+                self.renderer.gfx.config.width,
+                self.renderer.gfx.config.height,
+            ],
             pixels_per_point: self.egui_ctx.pixels_per_point(),
         };
 
@@ -364,7 +373,10 @@ impl App {
             self.renderer.egui_renderer.free_texture(id);
         }
 
-        self.renderer.gfx.queue.submit(std::iter::once(encoder.finish()));
+        self.renderer
+            .gfx
+            .queue
+            .submit(std::iter::once(encoder.finish()));
         frame.present();
 
         Ok(())

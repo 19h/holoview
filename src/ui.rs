@@ -120,7 +120,6 @@ pub fn draw_hud(egui_ctx: &egui::Context, altitude: i32, total_points: u32) {
 pub fn draw_debug_panel(
     egui_ctx: &egui::Context,
     params: &mut PostParams,
-    point_size: &mut f32,
     gamma_deg: f64,
 ) {
     Area::new("debug_panel".into())
@@ -128,13 +127,11 @@ pub fn draw_debug_panel(
         .show(egui_ctx, |ui| {
             Frame::dark_canvas(ui.style()).show(ui, |ui| {
                 let defaults = PostParams::default();
-                const DEFAULT_POINT_SIZE: f32 = 1.0;
 
                 ui.horizontal(|ui| {
                     ui.heading("Debug");
                     if ui.button("Reset All").clicked() {
                         *params = defaults;
-                        *point_size = DEFAULT_POINT_SIZE;
                     }
                 });
 
@@ -144,9 +141,6 @@ pub fn draw_debug_panel(
                     ui.checkbox(&mut params.rgb_on, "RGB shift");
                     ui.checkbox(&mut params.crt_on, "CRT");
                 });
-                ui.separator();
-                ui.label("Point size (px)");
-                ui.add(egui::Slider::new(point_size, 1.0..=12.0));
                 ui.separator();
 
                 ui.collapsing("Grid", |ui| {
