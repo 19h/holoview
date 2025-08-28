@@ -117,13 +117,18 @@ pub fn draw_hud(egui_ctx: &egui::Context, altitude: i32, total_points: u32) {
     }
 }
 
-pub fn draw_debug_panel(egui_ctx: &egui::Context, params: &mut PostParams, point_size: &mut f32) {
+pub fn draw_debug_panel(
+    egui_ctx: &egui::Context,
+    params: &mut PostParams,
+    point_size: &mut f32,
+    gamma_deg: f64,
+) {
     Area::new("debug_panel".into())
         .fixed_pos(egui::pos2(40.0, 140.0))
         .show(egui_ctx, |ui| {
             Frame::dark_canvas(ui.style()).show(ui, |ui| {
                 let defaults = PostParams::default();
-                const DEFAULT_POINT_SIZE: f32 = 4.0;
+                const DEFAULT_POINT_SIZE: f32 = 1.0;
 
                 ui.horizontal(|ui| {
                     ui.heading("Debug");
@@ -134,7 +139,6 @@ pub fn draw_debug_panel(egui_ctx: &egui::Context, params: &mut PostParams, point
                 });
 
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut params.grid_on, "Grid");
                     ui.checkbox(&mut params.edl_on, "EDL");
                     ui.checkbox(&mut params.sem_on, "Semantic");
                     ui.checkbox(&mut params.rgb_on, "RGB shift");
@@ -144,6 +148,15 @@ pub fn draw_debug_panel(egui_ctx: &egui::Context, params: &mut PostParams, point
                 ui.label("Point size (px)");
                 ui.add(egui::Slider::new(point_size, 1.0..=12.0));
                 ui.separator();
+
+                ui.collapsing("Grid", |ui| {
+                    ui.checkbox(&mut params.grid_on, "Visible");
+                    ui.separator();
+                    ui.label("Alignment");
+                    ui.radio_value(&mut params.grid_utm_align, false, "True North");
+                    ui.radio_value(&mut params.grid_utm_align, true, "UTM Grid North");
+                    ui.label(format!("Convergence (γ): {:.4}°", gamma_deg));
+                });
 
                 ui.collapsing("EDL", |ui| {
                     if ui.button("Reset").clicked() {

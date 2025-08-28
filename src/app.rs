@@ -10,6 +10,24 @@ use std::sync::Arc;
 use walkdir::WalkDir;
 use winit::{event::WindowEvent, window::Window};
 
+// --- Geodetic Helpers for Grid Convergence ---
+
+/// Calculates the central meridian of a standard UTM zone in degrees longitude.
+fn utm_central_meridian_deg(lon_deg: f64) -> f64 {
+    // UTM zone number (standard formula)
+    let zone = ((lon_deg + 180.0) / 6.0).floor() + 1.0;
+    // Central meridian of that zone
+    -183.0 + 6.0 * zone
+}
+
+/// Calculates the meridian (grid) convergence angle, γ, in radians.
+fn meridian_convergence_rad(lat_deg: f64, lon_deg: f64) -> f64 {
+    let phi = lat_deg.to_radians();
+    let lam = lon_deg.to_radians();
+    let lam0 = utm_central_meridian_deg(lon_deg).to_radians();
+    ((lam - lam0).tan() * phi.sin()).atan()
+}
+
 pub struct App {
     pub renderer: Renderer,
     pub camera: Camera,
@@ -53,7 +71,7 @@ impl App {
             egui_ctx,
             egui_state,
             tiles: Vec::new(),
-            point_size: 4.0,
+            point_size: 1.0,
         })
     }
 
@@ -61,8 +79,11 @@ impl App {
         if new_size.width > 0 && new_size.height > 0 {
             self.renderer.resize(new_size);
             self.camera.proj = Mat4::perspective_rh(
+                // Field of view
                 60f32.to_radians(),
+                // Aspect ratio
                 new_size.width as f32 / new_size.height as f32,
+                // Near plane distance
                 10.0,
                 20_000_000.0,
             );
@@ -123,20 +144,26 @@ impl App {
                 Ok(tile) => {
                     // Convert this tile's anchor to meters using ITS UPM.
                     let upm = tile.units_per_meter as f64;
+
                     let a_m = [
                         tile.anchor_units[0] as f64 / upm,
                         tile.anchor_units[1] as f64 / upm,
                         tile.anchor_units[2] as f64 / upm,
                     ];
+
                     anchors_m.push(a_m);
+
                     let w = tile.instances_len as f64; // weight by points
+
                     sum_anchor_w[0] += a_m[0] * w;
                     sum_anchor_w[1] += a_m[1] * w;
                     sum_anchor_w[2] += a_m[2] * w;
+
                     sum_w += w;
 
                     min_upm = min_upm.min(tile.units_per_meter);
                     max_upm = max_upm.max(tile.units_per_meter);
+
                     total_points += tile.instances_len as u64;
 
                     log::debug!(
@@ -146,6 +173,7 @@ impl App {
                         a_m[0], a_m[1], a_m[2],
                         tile.instances_len
                     );
+
                     loaded_tiles.push(tile);
                 }
                 Err(e) => {
@@ -166,10 +194,13 @@ impl App {
             let r = (center_ecef_m[0]*center_ecef_m[0]
                    + center_ecef_m[1]*center_ecef_m[1]
                    + center_ecef_m[2]*center_ecef_m[2]).sqrt();
+
             // Accept only ~6.2–6.5 Mm (allows terrain + a few km)
             let plausible = (6_200_000.0..=6_500_000.0).contains(&r);
+
             let mut lat_opt = None;
             let mut lon_opt = None;
+
             if plausible {
                 let (lat, lon, _h) = hypc::ecef_to_geodetic(
                     center_ecef_m[0], center_ecef_m[1], center_ecef_m[2]);
@@ -187,13 +218,16 @@ impl App {
 
             // Approximate dataset radius from anchor spread
             let mut r2_max = 0.0f64;
+
             for a in &anchors_m {
                 let dx = a[0] - center_ecef_m[0];
                 let dy = a[1] - center_ecef_m[1];
                 let dz = a[2] - center_ecef_m[2];
                 r2_max = r2_max.max(dx*dx + dy*dy + dz*dz);
             }
+
             let radius_m = r2_max.sqrt();
+
             // Choose a conservative starting altitude
             let start_alt_m = (radius_m * 1.2).clamp(50.0, 50_000.0);
             self.camera.h_m = start_alt_m;
@@ -205,6 +239,7 @@ impl App {
                 "Loaded {} tiles | points={} | UPM range [{}..{}].",
                 loaded_tiles.len(), total_points, min_upm, max_upm
             );
+
             if let (Some(lat), Some(lon)) = (lat_opt, lon_opt) {
                 log::info!(
                     "Dataset center ECEF(m)=({:.3},{:.3},{:.3}) -> geodetic ({:.6}°, {:.6}°). \
@@ -258,10 +293,14 @@ impl App {
         );
 
         if true {
+            let gamma_deg =
+                meridian_convergence_rad(self.camera.lat_deg, self.camera.lon_deg).to_degrees();
+
             ui::draw_debug_panel(
                 &self.egui_ctx,
                 &mut self.renderer.post_stack.params,
                 &mut self.point_size,
+                gamma_deg,
             );
         }
 

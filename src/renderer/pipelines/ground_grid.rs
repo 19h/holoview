@@ -4,6 +4,24 @@ use crate::camera::Camera;
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
+// --- Geodetic Helpers for Grid Convergence ---
+
+/// Calculates the central meridian of a standard UTM zone in degrees longitude.
+fn utm_central_meridian_deg(lon_deg: f64) -> f64 {
+    // UTM zone number (standard formula)
+    let zone = ((lon_deg + 180.0) / 6.0).floor() + 1.0;
+    // Central meridian of that zone
+    -183.0 + 6.0 * zone
+}
+
+/// Calculates the meridian (grid) convergence angle, γ, in radians.
+fn meridian_convergence_rad(lat_deg: f64, lon_deg: f64) -> f64 {
+    let phi = lat_deg.to_radians();
+    let lam = lon_deg.to_radians();
+    let lam0 = utm_central_meridian_deg(lon_deg).to_radians();
+    ((lam - lam0).tan() * phi.sin()).atan()
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GridUniforms {
@@ -163,6 +181,7 @@ impl GroundGridPipeline {
         rpass:  &mut wgpu::RenderPass<'a>,
         queue:  &wgpu::Queue,
         camera: &Camera,
+        grid_utm_align: bool,
     ) {
         // Tangent point on the ellipsoid (height = 0)
         let tangent_ecef = hypc::geodetic_to_ecef(camera.lat_deg, camera.lon_deg, 0.0);
@@ -176,11 +195,19 @@ impl GroundGridPipeline {
             (tangent_ecef[2] - cam_ecef[2]) as f32,
         );
 
+        // Calculate grid convergence angle (gamma) if aligning to UTM grid north.
+        let gamma = if grid_utm_align {
+            meridian_convergence_rad(camera.lat_deg, camera.lon_deg) as f32
+        } else {
+            0.0
+        };
+
         // Build a model that aligns the plane with ENU (world), NOT the camera.
         let r_ecef_to_enu = camera.ecef_to_enu_matrix();
         let r_enu_to_ecef = r_ecef_to_enu.transpose(); // orthonormal inverse
         let model = Mat4::from_translation(rel_pos)
             * Mat4::from_mat3(r_enu_to_ecef)
+            * Mat4::from_rotation_z(gamma) // Rotate grid to UTM grid-north
             * Mat4::from_scale(Vec3::splat(self.plane_extent_m));
 
         // EN offset (meters) of this tangent plane relative to the world anchor.

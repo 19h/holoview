@@ -3,6 +3,16 @@ use glam::{Mat3, Mat4, Vec3};
 use hypc::{geodetic_to_ecef, split_f64_to_f32_pair};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
+/// This matrix converts clip-space coordinates from OpenGL conventions (Y-up, Z in [-1, 1])
+/// to WebGPU conventions (Y-down, Z in [0, 1]).
+#[rustfmt::skip]
+pub const OPENGL_TO_WGPU_MATRIX: Mat4 = Mat4::from_cols_array(&[
+    1.0,  0.0, 0.0, 0.0,
+    0.0, -1.0, 0.0, 0.0,
+    0.0,  0.0, 0.5, 0.0,
+    0.0,  0.0, 0.5, 1.0,
+]);
+
 #[derive(Debug, Clone)]
 pub struct Camera {
     // Geodetic position
@@ -47,16 +57,24 @@ impl Camera {
         let (sin_lon, cos_lon) = lon_rad.sin_cos();
 
         // East, North, Up basis vectors.
-        let east  = Vec3::new(-sin_lon as f32, cos_lon as f32, 0.0);
-        let north = Vec3::new((-sin_lat * cos_lon) as f32, (-sin_lat * sin_lon) as f32, cos_lat as f32);
-        let up    = Vec3::new((cos_lat * cos_lon) as f32, (cos_lat * sin_lon) as f32, sin_lat as f32);
+        let east = Vec3::new(-sin_lon as f32, cos_lon as f32, 0.0);
+        let north = Vec3::new(
+            (-sin_lat * cos_lon) as f32,
+            (-sin_lat * sin_lon) as f32,
+            cos_lat as f32,
+        );
+        let up = Vec3::new(
+            (cos_lat * cos_lon) as f32,
+            (cos_lat * sin_lon) as f32,
+            sin_lat as f32,
+        );
 
         Mat3::from_cols(east, north, up).transpose()
     }
 
     /// Returns combined view‑projection matrix in ECEF meters.
     pub fn view_proj_ecef(&self) -> Mat4 {
-        self.proj * self.view_ecef()
+        OPENGL_TO_WGPU_MATRIX * self.proj * self.view_ecef()
     }
 
     /// Rotation‑only view matrix: transforms from ECEF to camera frame.

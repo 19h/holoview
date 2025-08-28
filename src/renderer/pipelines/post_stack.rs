@@ -200,6 +200,7 @@ pub struct PostParams {
     pub rgb_on: bool,
     pub crt_on: bool,
     pub grid_on: bool,
+    pub grid_utm_align: bool,
 
     /// 0 = Off (normal path)
     /// 1 = Depth (RT1.r) grayscale
@@ -224,6 +225,7 @@ impl Default for PostParams {
             rgb_on:  true,
             crt_on:  true,
             grid_on: true,
+            grid_utm_align: false,
 
             debug_mode: 0,
         }

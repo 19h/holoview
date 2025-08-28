@@ -114,7 +114,12 @@ impl Renderer {
 
             // Draw the grid first, so it's behind the points
             if self.post_stack.params.grid_on {
-                self.grid.draw(&mut pass, &self.gfx.queue, camera);
+                self.grid.draw(
+                    &mut pass,
+                    &self.gfx.queue,
+                    camera,
+                    self.post_stack.params.grid_utm_align,
+                );
             }
 
             // Draw all point cloud tiles
