@@ -1276,25 +1276,6 @@ fn quantize_with_anchor(points_m: &[[f64; 3]], requested_upm: u32) -> Quantized 
     }
 }
 
-/// Compute East‑North‑Up orthonormal basis vectors for a given latitude/longitude.
-#[inline]
-fn enu_basis(lat_deg: f64, lon_deg: f64) -> ([f64; 3], [f64; 3], [f64; 3]) {
-    let lat = lat_deg.to_radians();
-    let lon = lon_deg.to_radians();
-
-    let (sl, cl) = lat.sin_cos(); // sin(lat), cos(lat)
-    let (so, co) = lon.sin_cos(); // sin(lon), cos(lon)
-
-    // East vector
-    let e = [-so, co, 0.0];
-    // North vector
-    let n = [-sl * co, -sl * so, cl];
-    // Up vector
-    let u = [cl * co, cl * so, sl];
-
-    (e, n, u)
-}
-
 fn process_one_mesh(
     path: &Path,
     args: &Args,
@@ -1430,52 +1411,64 @@ fn process_one_mesh(
             // Calculate local coordinate bounds for debugging
             let (mut min_x, mut max_x) = (f64::INFINITY, f64::NEG_INFINITY);
             let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
-            let (mut min_z, mut max_z) = (f64::INFINITY, f64::NEG_INFINITY);
-            for &[x, y, z] in &raw_xyz {
+
+            for &[x, y, _] in &raw_xyz {
                 min_x = min_x.min(x); max_x = max_x.max(x);
                 min_y = min_y.min(y); max_y = max_y.max(y);
-                min_z = min_z.min(z); max_z = max_z.max(z);
             }
-
-            // Robust anchor height: median Z value of the vertices.
-            let mut heights: Vec<f64> = raw_xyz.iter().map(|p| p[2]).collect();
-            let median_idx = heights.len() / 2;
-
-            heights.select_nth_unstable_by(median_idx, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-            let anchor_h = heights[median_idx];
 
             // Derive a planar origin so large UTM-like values become small offsets
             let e0 = 0.5 * (min_x + max_x);
             let n0 = 0.5 * (min_y + max_y);
 
             debug!(
-                "Local origin (E0,N0,U0)=({:.2}, {:.2}, {:.2}) m",
-                e0, n0, anchor_h
+                "Local planar origin (E0,N0)=({:.2}, {:.2}) m",
+                e0, n0
             );
 
-            // ECEF centre of the tile at the median height.
-            let ecef_center = geodetic_to_ecef(lat_c, lon_c, anchor_h);
-            debug!("ECEF anchor point: [{:.1}, {:.1}, {:.1}]", ecef_center[0], ecef_center[1], ecef_center[2]);
+            // --- GEOMETRIC CORRECTION FOR EARTH CURVATURE ---
 
-            // ENU basis vectors at the centre point.
-            let (enu_e, enu_n, enu_u) = enu_basis(lat_c, lon_c);
-            debug!("ENU basis vectors computed for lat={:.6}, lon={:.6}", lat_c, lon_c);
+            // Calculate radii of curvature at the tile's center latitude.
+            let lat_c_rad = lat_c.to_radians();
+            let (sin_lat_c, cos_lat_c) = lat_c_rad.sin_cos();
 
-            // Transform *offset* ENU coords to ECEF
+            let a = hypc::wgs84::A;
+            let e2 = hypc::wgs84::E2;
+
+            let denom = (1.0 - e2 * sin_lat_c * sin_lat_c).sqrt();
+
+            // Prime vertical radius of curvature (for East-West distances)
+            let n = a / denom;
+
+            // Meridional radius of curvature (for North-South distances)
+            let m = a * (1.0 - e2) / (denom * denom * denom);
+
+            // Conversion factors from meters to degrees.
+            let meters_to_deg_lat = (1.0 / m).to_degrees();
+            let meters_to_deg_lon = (1.0 / (n * cos_lat_c)).to_degrees();
+
+            // Transform each point by calculating its precise geodetic coordinate
+            // and then converting to ECEF. This replaces the flawed tangent
+            // plane approximation.
             for &[x_e, y_n, z_u] in &raw_xyz {
-                let xe = x_e - e0;         // subtract planar origin
+                // Planar offsets from the tile's local origin
+                let xe = x_e - e0;
                 let yn = y_n - n0;
-                let zu = z_u - anchor_h;   // remove absolute height baseline
 
-                let x = ecef_center[0] + xe * enu_e[0] + yn * enu_n[0] + zu * enu_u[0];
-                let y = ecef_center[1] + xe * enu_e[1] + yn * enu_n[1] + zu * enu_u[1];
-                let z = ecef_center[2] + xe * enu_e[2] + yn * enu_n[2] + zu * enu_u[2];
+                // Convert meter offsets to latitude/longitude degree offsets
+                let d_lat = yn * meters_to_deg_lat;
+                let d_lon = xe * meters_to_deg_lon;
 
-                points_m.push([x, y, z]);
+                // Calculate the point's true geodetic coordinate
+                let point_lat = lat_c + d_lat;
+                let point_lon = lon_c + d_lon;
+                let point_h = z_u; // Assume z_u is height above ellipsoid
+
+                // Convert this precise geodetic coordinate to ECEF
+                points_m.push(geodetic_to_ecef(point_lat, point_lon, point_h));
             }
 
-            debug!("Successfully transformed {} ENU coordinates to ECEF", raw_xyz.len());
+            debug!("Successfully transformed {} ENU coordinates to ECEF with curvature correction", raw_xyz.len());
         }
         InputCs::Auto => unreachable!(),
     }
