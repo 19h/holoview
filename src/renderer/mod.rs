@@ -95,7 +95,7 @@ impl Renderer {
                         view: &self.targets.dlin,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 0.0 }),
                             store: wgpu::StoreOp::Store,
                         },
                     }),
@@ -113,7 +113,9 @@ impl Renderer {
             });
 
             // Draw the grid first, so it's behind the points
-            self.grid.draw(&mut pass, &self.gfx.queue, camera);
+            if self.post_stack.params.grid_on {
+                self.grid.draw(&mut pass, &self.gfx.queue, camera);
+            }
 
             // Draw all point cloud tiles
             for tile in tiles {

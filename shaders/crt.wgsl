@@ -15,14 +15,18 @@ struct Uniforms {
 
 struct VSOut {
     @builtin(position) clip: vec4<f32>,
-    @location(0)          uv:   vec2<f32>,
+    @location(0)         uv: vec2<f32>,
 }
 
 @vertex
 fn vs_main(@location(0) pos: vec2<f32>) -> VSOut {
     var out: VSOut;
     out.clip = vec4<f32>(pos, 0.0, 1.0);
-    out.uv   = 0.5 * (pos + vec2<f32>(1.0, 1.0));
+    // Correctly map clip space to UV space for WebGPU/Vulkan/Metal.
+    // Clip space Y is -1 (bottom) to +1 (top).
+    // UV space Y is  0 (top)    to  1 (bottom).
+    // The Y-coordinate must be flipped.
+    out.uv = vec2<f32>(0.5 * (pos.x + 1.0), 0.5 * (-pos.y + 1.0));
     return out;
 }
 
@@ -32,10 +36,10 @@ fn hash(p: vec2<f32>) -> f32 {
 
 @fragment
 fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
-    // Clamp FS‑triangle UVs to [0,1] and sample with the NonFiltering sampler
+    // Clamp FS-triangle UVs to [0,1] and sample with the NonFiltering sampler
     let uv = clamp(in.uv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
 
-    // Sample source texture (LOD 0.0 required for non‑filtering sampler)
+    // Sample source texture (LOD 0.0 required for non-filtering sampler)
     let uv_c = in.uv;
     let src_color = textureSampleLevel(tSrc, samp, uv_c, 0.0).rgb;
 
@@ -72,8 +76,10 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let depth_z      = depth_sample.r;
     let depth_alpha  = depth_sample.a; // 1 = real background, 0 = overlay (grid)
 
-    // Keep thresholds consistent with other passes
-    let bg_mask      = step(0.9999, depth_z) * step(0.5, depth_alpha);
+    // Background if z≈1 OR the pixel is grid/overlay (tag<0.5)
+    let is_far  = step(0.9999, depth_z);
+    let is_grid = 1.0 - step(0.5, depth_alpha);
+    let bg_mask = max(is_far, is_grid);
 
     // Combine colours
     let bg_color = (bg_base * 0.85 + grain) * scan_bg;

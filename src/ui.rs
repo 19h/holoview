@@ -1,6 +1,7 @@
 //! UI rendering using egui.
 
 use egui::{Area, Frame, RichText};
+use crate::renderer::pipelines::post_stack::PostParams;
 
 /// Draws the HUD overlay, including corner brackets and status text.
 pub fn draw_hud(egui_ctx: &egui::Context, altitude: i32, total_points: u32) {
@@ -113,4 +114,30 @@ pub fn draw_hud(egui_ctx: &egui::Context, altitude: i32, total_points: u32) {
                 });
             });
     }
+}
+
+pub fn draw_debug_panel(egui_ctx: &egui::Context, params: &mut PostParams, point_size: &mut f32) {
+    Area::new("debug_panel".into())
+        .fixed_pos(egui::pos2(40.0, 140.0))
+        .show(egui_ctx, |ui| {
+            Frame::dark_canvas(ui.style()).show(ui, |ui| {
+                ui.heading("Debug");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut params.grid_on, "Grid");
+                    ui.checkbox(&mut params.edl_on,  "EDL");
+                    ui.checkbox(&mut params.sem_on,  "Semantic");
+                    ui.checkbox(&mut params.rgb_on,  "RGB shift");
+                    ui.checkbox(&mut params.crt_on,  "CRT");
+                });
+                ui.separator();
+                ui.label("Point size (px)");
+                ui.add(egui::Slider::new(point_size, 1.0..=12.0));
+                ui.separator();
+                ui.label("Debug View");
+                ui.radio_value(&mut params.debug_mode, 0, "Off");
+                ui.radio_value(&mut params.debug_mode, 1, "Depth");
+                ui.radio_value(&mut params.debug_mode, 2, "Labels");
+                ui.radio_value(&mut params.debug_mode, 3, "Tag");
+            });
+        });
 }

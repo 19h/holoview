@@ -101,6 +101,14 @@ struct UboCrt {
     _pad: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+struct UboDbg {
+    mode: u32,
+    _pad0: [u32; 3], // keep 16-byte alignment for the vec3 equivalent
+    _pad1: [u32; 4], // struct-size padding so total = 32 bytes
+}
+
 // -------------------- Pass Types --------------------
 
 struct EdlPass {
@@ -135,6 +143,14 @@ struct CrtPass {
     fs_vbo: wgpu::Buffer,
 }
 
+struct DebugPass {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    ubo: wgpu::Buffer,
+    fs_vbo: wgpu::Buffer,
+}
+
 // -------------------- Post Parameters & Stack --------------------
 
 #[derive(Clone, Copy, Debug)]
@@ -146,6 +162,19 @@ pub struct PostParams {
     pub rgb_angle: f32,
     pub crt_intensity: f32,
     pub crt_vignette: f32,
+
+    // 🔧 Debug toggles
+    pub edl_on: bool,
+    pub sem_on: bool,
+    pub rgb_on: bool,
+    pub crt_on: bool,
+    pub grid_on: bool,
+
+    /// 0 = Off (normal path)
+    /// 1 = Depth (RT1.r) grayscale
+    /// 2 = Labels (class color)
+    /// 3 = Tag (RT1.a) monocrome
+    pub debug_mode: u32,
 }
 
 impl Default for PostParams {
@@ -158,6 +187,14 @@ impl Default for PostParams {
             rgb_angle: 0.9,
             crt_intensity: 0.25,
             crt_vignette: 0.8,
+
+            edl_on:  true,
+            sem_on:  true,
+            rgb_on:  true,
+            crt_on:  true,
+            grid_on: true,
+
+            debug_mode: 0,
         }
     }
 }
@@ -168,6 +205,7 @@ pub struct PostStack {
     sem: SemPost,
     rgb: RgbShiftPass,
     crt: CrtPass,
+    dbg: DebugPass,
     pub params: PostParams,
     start: Instant,
 }
@@ -190,6 +228,7 @@ impl PostStack {
             sem,
             rgb,
             crt,
+            dbg: DebugPass::new(device, out_fmt),
             params: PostParams::default(),
             start: Instant::now(),
         }
@@ -209,61 +248,102 @@ impl PostStack {
         scene_color_src: &wgpu::TextureView,
         depthlin: &wgpu::TextureView,
     ) {
-        let w = self.pingpong.size.width.max(1) as f32;
-        let h = self.pingpong.size.height.max(1) as f32;
-        let inv_size = [1.0 / w, 1.0 / h];
-        let t = self.start.elapsed().as_secs_f32();
+        let width = self.pingpong.size.width.max(1) as f32;
+        let height = self.pingpong.size.height.max(1) as f32;
+        let inv_size = [1.0 / width, 1.0 / height];
+        let time = self.start.elapsed().as_secs_f32();
 
-        // 1️⃣ EDL
-        self.edl.draw(
-            device,
-            queue,
-            encoder,
-            &self.pingpong.ping,
-            scene_color_src,
-            depthlin,
-            inv_size,
-            self.params.edl_strength,
-            self.params.edl_radius_px,
-        );
+        // Current source pointer
+        let mut src = scene_color_src;
 
-        // 2️⃣ Semantic grading
-        self.sem.draw(
-            device,
-            queue,
-            encoder,
-            &self.pingpong.pong,
-            &self.pingpong.ping,
-            depthlin,
-            self.params.sem_amount,
-        );
+        // Enhanced Depth Linearity pass
+        if self.params.edl_on {
+            self.edl.draw(
+                device,
+                queue,
+                encoder,
+                &self.pingpong.ping,
+                src,
+                depthlin,
+                inv_size,
+                self.params.edl_strength,
+                self.params.edl_radius_px,
+            );
+            src = &self.pingpong.ping;
+        }
 
-        // 3️⃣ RGB shift
-        self.rgb.draw(
-            device,
-            queue,
-            encoder,
-            &self.pingpong.ping,
-            &self.pingpong.pong,
-            depthlin,
-            inv_size,
-            self.params.rgb_amount,
-            self.params.rgb_angle,
-        );
+        // Semantic overlay pass
+        if self.params.sem_on {
+            self.sem.draw(
+                device,
+                queue,
+                encoder,
+                &self.pingpong.pong,
+                src,
+                depthlin,
+                self.params.sem_amount,
+            );
+            src = &self.pingpong.pong;
+        }
 
-        // 4️⃣ CRT effect
-        self.crt.draw(
-            device,
-            queue,
-            encoder,
-            swapchain_dst,
-            &self.pingpong.ping,
-            depthlin,
-            inv_size,
-            t,
-            self.params.crt_intensity,
-            self.params.crt_vignette,
-        );
+        // RGB shift pass
+        if self.params.rgb_on {
+            self.rgb.draw(
+                device,
+                queue,
+                encoder,
+                &self.pingpong.ping,
+                src,
+                depthlin,
+                inv_size,
+                self.params.rgb_amount,
+                self.params.rgb_angle,
+            );
+            src = &self.pingpong.ping;
+        }
+
+        // Debug visualization, if requested
+        if self.params.debug_mode != 0 {
+            self.dbg.draw(
+                device,
+                queue,
+                encoder,
+                swapchain_dst,
+                src,
+                depthlin,
+                self.params.debug_mode,
+            );
+            return;
+        }
+
+        // CRT emulation pass (final output)
+        if self.params.crt_on {
+            self.crt.draw(
+                device,
+                queue,
+                encoder,
+                swapchain_dst,
+                src,
+                depthlin,
+                inv_size,
+                time,
+                self.params.crt_intensity,
+                self.params.crt_vignette,
+            );
+        } else {
+            // Identity copy using RGB pass with zero amount
+            self.rgb.draw(
+                device,
+                queue,
+                encoder,
+                swapchain_dst,
+                src,
+                depthlin,
+                inv_size,
+                0.0,
+                0.0,
+            );
+        }
     }
 }
 
@@ -399,6 +479,7 @@ create_post_pass!(EdlPass, UboEdl, "edl.wgsl");
 create_post_pass!(SemPost, UboSem, "sem_post.wgsl");
 create_post_pass!(RgbShiftPass, UboRgb, "rgbshift.wgsl");
 create_post_pass!(CrtPass, UboCrt, "crt.wgsl");
+create_post_pass!(DebugPass, UboDbg, "debug_vis.wgsl");
 
 fn execute_pass(
     pipeline: &wgpu::RenderPipeline,
@@ -618,5 +699,53 @@ impl CrtPass {
             ],
         });
         execute_pass(&self.pipeline, encoder, &bind, &self.fs_vbo, dst, "Crt Pass");
+    }
+}
+
+impl DebugPass {
+    pub fn draw(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &wgpu::TextureView,
+        t_src: &wgpu::TextureView,
+        t_depth: &wgpu::TextureView,
+        mode: u32,
+    ) {
+        queue.write_buffer(
+            &self.ubo,
+            0,
+            bytemuck::bytes_of(&UboDbg {
+                mode,
+                _pad0: [0; 3],
+                _pad1: [0; 4],
+            }),
+        );
+
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("DebugVis Bind"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(t_src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(t_depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.ubo.as_entire_binding(),
+                },
+            ],
+        });
+
+        execute_pass(&self.pipeline, encoder, &bind, &self.fs_vbo, dst, "DebugVis Pass");
     }
 }

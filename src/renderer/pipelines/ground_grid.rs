@@ -8,16 +8,20 @@ use wgpu::util::DeviceExt;
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GridUniforms {
     /// Transform from model space to clip space.
-    pub model_view_proj: Mat4,
+    pub model_view_proj: Mat4,     // 64 B
     /// Camera height above the tangent plane, meters.
-    pub camera_height_m: f32,
-    pub _pad0: [f32; 3],
-    /// EN offset (meters) of this tangent plane relative to a fixed world anchor (dataset center).
-    pub enu_offset_m: [f32; 2],
-    /// Half‑extent (meters) used to scale the plane from NDC to world meters.
-    pub plane_extent_m: f32,
-    pub _pad1: [f32; 1],
+    pub camera_height_m: f32,      // +4
+    pub _pad0: [f32; 3],           // +12 -> 80
+    /// EN offset (meters) relative to world anchor; vec2 takes a 16‑B slot in uniforms.
+    pub enu_offset_m: [f32; 2],    // +8
+    pub _pad1: [f32; 2],           // +8  -> 96  (pad vec2 to 16)
+    /// Half‑extent (meters) from center to edge.
+    pub plane_extent_m: f32,       // +4
+    pub _pad2: [f32; 3],           // +12 -> 112 (struct size rounded to 16)
 }
+
+// Compile‑time safety check: buffer size must match WGSL‑reflected size.
+const _: [(); 112] = [(); core::mem::size_of::<GridUniforms>()];
 
 pub struct GroundGridPipeline {
     pipeline:       wgpu::RenderPipeline,
@@ -194,8 +198,9 @@ impl GroundGridPipeline {
             camera_height_m: camera.h_m as f32,
             _pad0:          [0.0; 3],
             enu_offset_m,
+            _pad1:          [0.0; 2],
             plane_extent_m: self.plane_extent_m,
-            _pad1:          [0.0],
+            _pad2:          [0.0; 3],
         };
 
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -241,7 +246,8 @@ struct FSOut {
 // Anti‑aliased line mask
 fn line(coord: f32, step: f32) -> f32 {
     let t   = coord / step;
-    let aaw = fwidth(t) * 1.5;
+    // Cap AA width so very small steps can't smear into a solid fill.
+    let aaw = min(fwidth(t) * 1.5, 0.5);
     let f   = fract(t);
     let d   = min(f, 1.0 - f);
     return 1.0 - smoothstep(0.0, aaw, d);
@@ -249,12 +255,18 @@ fn line(coord: f32, step: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VSOut) -> FSOut {
+    if (U.camera_height_m < 50.0 || U.camera_height_m > 200000.0) {
+        discard;
+    }
+
     let log_h = log2(U.camera_height_m);
 
     // Grid spacing levels
     let level0_log = floor(log_h / log2(10.0));
-    let level0_step = pow(10.0, level0_log);
-    let level1_step = level0_step * 10.0;
+    // Do not allow sub‑meter cells; this keeps line density bounded.
+    let min_step    = 1.0;
+    let level0_step = max(pow(10.0, level0_log), min_step);
+    let level1_step = max(level0_step * 10.0, min_step * 10.0);
 
     // Blend factor between levels
     let t = fract(log_h / log2(10.0));
@@ -272,10 +284,10 @@ fn fs_main(in: VSOut) -> FSOut {
 
     // Fade at extreme heights
     let opacity = grid * (1.0 - smoothstep(20000.0, 200000.0, U.camera_height_m));
-    let color   = vec3<f32>(0.90, 0.15, 0.15);
+    let color   = vec3<f32>(0.176, 0.969, 1.000); // HUD cyan
 
     var out: FSOut;
-    out.color = vec4<f32>(color, opacity * 0.55);
+    out.color = vec4<f32>(color, opacity * 0.10); // was 0.18
     // Overlay tag (alpha=0) and background depth (r=1)
     out.dlin = vec4<f32>(1.0, 0.0, 0.0, 0.0);
     return out;
