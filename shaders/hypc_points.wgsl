@@ -10,7 +10,7 @@
      view_proj     : mat4x4<f32>,
      viewport_size : vec2<f32>,
      point_size_px : f32,
-     _pad2         : f32,
+     splat_radius_m : f32,
  };
 
  @group(0) @binding(0) var<uniform> U : TileUniform;
@@ -45,7 +45,12 @@
      }
 
      // Normal billboarding path
-     let point_size_ndc   = (U.point_size_px / U.viewport_size) * 2.0;
+     // Project physical LOD support to cover the represented source cells.
+     // Matrix row 1 has length equal to the vertical projection focal scale.
+     let focal_scale = length(vec3<f32>(U.view_proj[0][1], U.view_proj[1][1], U.view_proj[2][1]));
+     let world_radius_px = U.splat_radius_m * focal_scale * U.viewport_size.y * 0.5 / clip_center.w;
+     let radius_px = clamp(max(U.point_size_px, world_radius_px), 0.5, 128.0);
+     let point_size_ndc = (radius_px / U.viewport_size) * 2.0;
      let perspective_scale = clip_center.w; // w > 0 guaranteed here
      let offset = vec2<f32>(corner.x * point_size_ndc.x,
                             corner.y * point_size_ndc.y) * perspective_scale;

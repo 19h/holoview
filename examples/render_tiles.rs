@@ -19,7 +19,7 @@ fn main() -> Result<()> {
         52.513,
         13.375,
         1400.0,
-        Mat4::perspective_rh(60f32.to_radians(), 1.0, 0.1, 100_000.0),
+        Mat4::perspective_infinite_reverse_rh(60f32.to_radians(), 1.0, 0.1),
     );
     let mut paths = std::fs::read_dir(root)?
         .map(|v| v.map(|e| e.path()))

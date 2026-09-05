@@ -195,6 +195,7 @@ pub struct PostParams {
     pub crt_vignette: f32,
 
     // 🔧 Debug toggles
+    pub fill_on: bool,
     pub edl_on: bool,
     pub sem_on: bool,
     pub rgb_on: bool,
@@ -220,6 +221,7 @@ impl Default for PostParams {
             crt_intensity: 1.0,
             crt_vignette: 0.8,
 
+            fill_on: true,
             edl_on:  true,
             sem_on:  true,
             rgb_on:  true,

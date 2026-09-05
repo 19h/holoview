@@ -8,7 +8,6 @@ use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
-    io::BufReader,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -216,10 +215,9 @@ fn bbox_from_polygon_deg(poly: &Geometry) -> GeoBboxDeg {
 }
 
 fn load_feature_index(path: &str) -> anyhow::Result<Vec<WorkItem>> {
-    // Open and deserialize the GeoJSON feature collection.
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let root: GeoJsonRoot = serde_json::from_reader(reader)?;
+    // The Berlin 2025 GeoJSON is UTF-8 with a BOM; serde_json rejects the BOM.
+    let text = fs::read_to_string(path)?;
+    let root: GeoJsonRoot = serde_json::from_str(text.trim_start_matches('\u{feff}'))?;
 
     // Transform each feature into a `WorkItem`.
     let items = root

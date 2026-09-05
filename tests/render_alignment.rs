@@ -17,7 +17,7 @@ fn tile_partition_does_not_change_rendered_location() {
             lat,
             lon,
             180.0,
-            Mat4::perspective_rh(60f32.to_radians(), 1.0, 0.1, 10000.0),
+            Mat4::perspective_infinite_reverse_rh(60f32.to_radians(), 1.0, 0.1),
         );
         camera.set_target_and_radius(p, 180.0);
         let mut tiles = Vec::new();
@@ -102,7 +102,7 @@ fn semantic_geometry_remains_visible_at_large_eye_depth() {
             52.513,
             13.375,
             distance,
-            Mat4::perspective_rh(60f32.to_radians(), 1.0, 10.0, 20_000_000.0),
+            Mat4::perspective_infinite_reverse_rh(60f32.to_radians(), 1.0, 10.0),
         );
         camera.set_target_and_radius(p, distance);
         let tile = load_hypc_tile(

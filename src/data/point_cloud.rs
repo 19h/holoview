@@ -11,14 +11,16 @@ mod wgpu_util {
 }
 use wgpu_util::*;
 
-/// Read one HYPC tile from disk and upload to GPU (instances + per-tile UBO).
-pub fn load_hypc_tile(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    camera: &Camera,
-    path: &Path,
-    viewport_size: [f32; 2], // Initial viewport size
-) -> Result<TileGpu> {
+/// CPU decoding is independent of the render thread and GPU.
+#[derive(Debug)]
+pub struct PreparedTile {
+    pub key: Option<[u8; 32]>,
+    pub units_per_meter: u32,
+    pub anchor_units: [i64; 3],
+    pub instances: Vec<PointInstance>,
+}
+
+pub fn prepare_hypc_tile(path: &Path) -> Result<PreparedTile> {
     let tile: HypcTile = read_file(path)?;
     let inv_upm_f64 = (tile.units_per_meter as f64).recip();
 
@@ -161,6 +163,35 @@ pub fn load_hypc_tile(
         );
     }
 
+    anyhow::ensure!(!instances.is_empty(), "Empty HYPC tile: {}", path.display());
+    Ok(PreparedTile {
+        key: tile.tile_key,
+        units_per_meter: tile.units_per_meter,
+        anchor_units: tile.anchor_ecef_units,
+        instances,
+    })
+}
+
+/// Compatibility entry point for individual tiles and rendering regressions.
+pub fn load_hypc_tile(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    camera: &Camera,
+    path: &Path,
+    viewport_size: [f32; 2],
+) -> Result<TileGpu> {
+    let tile = prepare_hypc_tile(path)?;
+    Ok(upload_tile(device, layout, camera, &tile, viewport_size))
+}
+
+pub fn upload_tile(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    camera: &Camera,
+    tile: &PreparedTile,
+    viewport_size: [f32; 2],
+) -> TileGpu {
+    let instances = &tile.instances;
     // GPU upload
     let vtx = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("HYPC Instances"),
@@ -169,7 +200,7 @@ pub fn load_hypc_tile(
     });
 
     let tile_ubo_data = camera.make_tile_uniform(
-        tile.anchor_ecef_units,
+        tile.anchor_units,
         tile.units_per_meter,
         viewport_size,
         1.0, // Default point size
@@ -190,13 +221,13 @@ pub fn load_hypc_tile(
         }],
     });
 
-    Ok(TileGpu {
-        key: tile.tile_key,
+    TileGpu {
+        key: tile.key,
         units_per_meter: tile.units_per_meter,
-        anchor_units: tile.anchor_ecef_units,
+        anchor_units: tile.anchor_units,
         instances_len: instances.len() as u32,
         vtx,
         ubo,
         bind,
-    })
+    }
 }

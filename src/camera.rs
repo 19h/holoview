@@ -2,6 +2,8 @@ use crate::data::types::TileUniformStd140 as TileUniform;
 use glam::{DMat3, DVec3, Mat3, Mat4, Vec3};
 use hypc::{ecef_to_geodetic, geodetic_to_ecef, split_f64_to_f32_pair};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct Camera {
@@ -198,77 +200,184 @@ impl Camera {
             view_proj: self.view_proj_ecef().to_cols_array_2d(),
             viewport_size,
             point_size_px,
-            _pad2: 0.0,
+            splat_radius_m: 0.0,
         }
     }
 }
 
+/// Navigation state is advanced with elapsed time, independently of OS key repeat.
 pub struct CameraController {
-    mouse_down: bool,
+    pan_down: bool,
+    orbit_down: bool,
     last_mouse: Option<(f64, f64)>,
+    viewport: [f64; 2],
+    keys: HashSet<KeyCode>,
+}
+
+impl Default for CameraController {
+    fn default() -> Self { Self::new() }
 }
 
 impl CameraController {
-    /// Creates a new controller with default state.
     pub fn new() -> Self {
         Self {
-            mouse_down: false,
-            last_mouse: None,
+            pan_down: false, orbit_down: false, last_mouse: None,
+            viewport: [1280.0, 720.0], keys: HashSet::new(),
         }
     }
 
-    /// Handles window events and updates the camera.
-    pub fn handle_event(&mut self, event: &WindowEvent, camera: &mut Camera) {
-        match event {
-            WindowEvent::MouseInput { button, state, .. } => {
-                if *button == MouseButton::Left {
-                    self.mouse_down = *state == ElementState::Pressed;
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.handle_cursor_orbit((position.x, position.y), camera);
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let scroll = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => *y,
-                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 120.0,
-                };
+    pub fn set_viewport(&mut self, width: u32, height: u32) {
+        self.viewport = [width.max(1) as f64, height.max(1) as f64];
+    }
 
-                self.handle_scroll(scroll, camera);
+    /// Always forward releases and focus loss, even when UI owns the input.
+    pub fn release_event(&mut self, event: &WindowEvent) {
+        match event {
+            WindowEvent::Focused(false) => {
+                self.keys.clear(); self.pan_down = false; self.orbit_down = false;
+                self.last_mouse = None;
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
+                if let PhysicalKey::Code(key) = event.physical_key { self.keys.remove(&key); }
+            }
+            WindowEvent::MouseInput { button, state: ElementState::Released, .. } => {
+                if *button == MouseButton::Left { self.pan_down = false; }
+                if matches!(button, MouseButton::Right | MouseButton::Middle) { self.orbit_down = false; }
             }
             _ => {}
         }
     }
 
-    /// Adjusts camera orbit radius based on scroll input.
-    fn handle_scroll(&mut self, delta: f32, camera: &mut Camera) {
-        // Positive delta = scroll up = zoom in = decrease radius.
-        let zoom = 1.1_f64.powf(-delta as f64);
-        camera.radius_m *= zoom;
-        camera.radius_m = camera.radius_m.clamp(10.0, 1_000_000.0);
+    pub fn handle_event(&mut self, event: &WindowEvent, camera: &mut Camera) {
+        self.release_event(event);
+        match event {
+            WindowEvent::Resized(size) => self.set_viewport(size.width, size.height),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(key) = event.physical_key {
+                    if event.state == ElementState::Pressed { self.keys.insert(key); }
+                }
+            }
+            WindowEvent::MouseInput { button, state, .. } => {
+                if *button == MouseButton::Left { self.pan_down = *state == ElementState::Pressed; }
+                if matches!(button, MouseButton::Right | MouseButton::Middle) {
+                    self.orbit_down = *state == ElementState::Pressed;
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let xy = (position.x, position.y);
+                if let Some(last) = self.last_mouse {
+                    if self.orbit_down || (self.pan_down && self.shift()) {
+                        camera.azimuth_rad -= (xy.0 - last.0) * 0.004;
+                        camera.elevation_rad += (xy.1 - last.1) * 0.004;
+                        Self::clamp_angles(camera);
+                    } else if self.pan_down {
+                        self.pan_pixels(last, xy, camera);
+                    }
+                }
+                self.last_mouse = Some(xy);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scroll = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => *y as f64,
+                    MouseScrollDelta::PixelDelta(pos) => pos.y / 80.0,
+                };
+                self.zoom(scroll, camera);
+            }
+            _ => {}
+        }
+    }
+
+    fn shift(&self) -> bool {
+        self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight)
+    }
+
+    fn axis(&self, positive: &[KeyCode], negative: &[KeyCode]) -> f64 {
+        (positive.iter().any(|k| self.keys.contains(k)) as i32
+            - negative.iter().any(|k| self.keys.contains(k)) as i32) as f64
+    }
+
+    pub fn update(&mut self, camera: &mut Camera, dt_s: f64) {
+        let dt = dt_s.clamp(0.0, 0.1);
+        let x = self.axis(&[KeyCode::KeyD, KeyCode::ArrowRight], &[KeyCode::KeyA, KeyCode::ArrowLeft]);
+        let y = self.axis(&[KeyCode::KeyW, KeyCode::ArrowUp], &[KeyCode::KeyS, KeyCode::ArrowDown]);
+        let length = x.hypot(y).max(1.0);
+        let speed = camera.radius_m * if self.shift() { 1.5 } else { 0.5 };
+        if x != 0.0 || y != 0.0 {
+            let (right, forward, _) = camera.navigation_basis();
+            camera.translate_surface((right * x + forward * y) * (speed * dt / length));
+        }
+        let rotate = self.axis(&[KeyCode::KeyE], &[KeyCode::KeyQ]);
+        let tilt = self.axis(&[KeyCode::KeyR, KeyCode::PageUp], &[KeyCode::KeyF, KeyCode::PageDown]);
+        if rotate != 0.0 || tilt != 0.0 {
+            camera.azimuth_rad += rotate * dt;
+            camera.elevation_rad += tilt * dt * 0.7;
+            Self::clamp_angles(camera);
+        }
+        let zoom = self.axis(&[KeyCode::Equal, KeyCode::NumpadAdd], &[KeyCode::Minus, KeyCode::NumpadSubtract]);
+        if zoom != 0.0 { self.zoom(zoom * dt * 8.0, camera); }
+    }
+
+    fn clamp_angles(camera: &mut Camera) {
+        camera.azimuth_rad = camera.azimuth_rad.rem_euclid(std::f64::consts::TAU);
+        camera.elevation_rad = camera.elevation_rad.clamp(3f64.to_radians(), 89.9f64.to_radians());
         camera.update();
     }
 
-    /// Rotates the camera around the target while the left mouse button is held.
-    fn handle_cursor_orbit(&mut self, xy: (f64, f64), camera: &mut Camera) {
-        if let Some(last) = self.last_mouse {
-            if self.mouse_down {
-                let dx = (xy.0 - last.0) * 0.005;
-                let dy = (last.1 - xy.1) * 0.005;
+    fn ground_hit(&self, xy: (f64, f64), camera: &Camera) -> Option<DVec3> {
+        let x = (2.0 * xy.0 / self.viewport[0] - 1.0) / camera.proj.x_axis.x as f64;
+        let y = (1.0 - 2.0 * xy.1 / self.viewport[1]) / camera.proj.y_axis.y as f64;
+        let ray = camera.view_ecef().transpose().transform_vector3(Vec3::new(x as f32, y as f32, -1.0)).as_dvec3().normalize();
+        let (_, _, up) = camera.navigation_basis();
+        let denom = ray.dot(up);
+        if denom >= -0.025 { return None; }
+        let eye = DVec3::from(camera.ecef_m());
+        let t = (camera.target_ecef - eye).dot(up) / denom;
+        if !(0.0..camera.radius_m * 40.0).contains(&t) { return None; }
+        Some(eye + ray * t)
+    }
 
-                camera.azimuth_rad -= dx;
-                camera.elevation_rad -= dy;
+    fn pan_pixels(&self, from: (f64, f64), to: (f64, f64), camera: &mut Camera) {
+        if let (Some(a), Some(b)) = (self.ground_hit(from, camera), self.ground_hit(to, camera)) {
+            camera.translate_surface(a - b);
+        } else {
+            let (right, forward, _) = camera.navigation_basis();
+            let m_per_px = 2.0 * camera.radius_m / (camera.proj.y_axis.y as f64 * self.viewport[1]);
+            camera.translate_surface((right * (from.0 - to.0) + forward * (to.1 - from.1)) * m_per_px);
+        }
+    }
 
-                // Clamp elevation to prevent flipping over the poles.
-                // 1 degree to 89 degrees.
-                camera.elevation_rad = camera
-                    .elevation_rad
-                    .clamp(1.0f64.to_radians(), 89.0f64.to_radians());
-
-                camera.update();
+    fn zoom(&self, delta: f64, camera: &mut Camera) {
+        let before = self.last_mouse.and_then(|xy| self.ground_hit(xy, camera));
+        camera.radius_m = (camera.radius_m * (-delta * 0.16).exp()).clamp(5.0, 150_000.0);
+        camera.update();
+        if let (Some(before), Some(xy)) = (before, self.last_mouse) {
+            if let Some(after) = self.ground_hit(xy, camera) {
+                camera.translate_surface(before - after);
             }
         }
-        self.last_mouse = Some(xy);
+    }
+}
+
+impl Camera {
+    /// Screen right and forward on the target tangent plane, with geodetic up.
+    pub fn navigation_basis(&self) -> (DVec3, DVec3, DVec3) {
+        let (lat, lon, _) = ecef_to_geodetic(self.target_ecef.x, self.target_ecef.y, self.target_ecef.z);
+        let (slat, clat) = lat.to_radians().sin_cos();
+        let (slon, clon) = lon.to_radians().sin_cos();
+        let east = DVec3::new(-slon, clon, 0.0);
+        let north = DVec3::new(-slat * clon, -slat * slon, clat);
+        let up = DVec3::new(clat * clon, clat * slon, slat);
+        let (s, c) = self.azimuth_rad.sin_cos();
+        (-east * c + north * s, -east * s - north * c, up)
+    }
+
+    /// Reproject each pan onto the same geodetic height, avoiding tangent-plane drift.
+    pub fn translate_surface(&mut self, displacement: DVec3) {
+        let (_, _, height) = ecef_to_geodetic(self.target_ecef.x, self.target_ecef.y, self.target_ecef.z);
+        let p = self.target_ecef + displacement;
+        let (lat, lon, _) = ecef_to_geodetic(p.x, p.y, p.z);
+        self.target_ecef = DVec3::from(geodetic_to_ecef(lat, lon, height));
+        self.update();
     }
 }
 
@@ -293,4 +402,67 @@ mod tests {
             assert!((clip.w - distance).abs() < distance * 2e-6);
         }
     }
+    fn navigation_camera() -> Camera {
+        let mut camera = Camera::new(52.516275, 13.3777, 1000.0,
+            Mat4::perspective_infinite_reverse_rh(60f32.to_radians(), 16.0 / 9.0, 0.1));
+        camera.set_target_and_radius(geodetic_to_ecef(52.516275, 13.3777, 40.0), 1000.0);
+        camera.elevation_rad = 60f64.to_radians(); camera.update(); camera
+    }
+
+    #[test]
+    fn navigation_is_time_based_and_diagonal_speed_is_normalized() {
+        let run = |fps: usize, diagonal: bool| {
+            let mut c = navigation_camera(); let start = c.target_ecef;
+            let mut input = CameraController::new(); input.keys.insert(KeyCode::KeyW);
+            if diagonal { input.keys.insert(KeyCode::KeyD); }
+            for _ in 0..fps { input.update(&mut c, 1.0 / fps as f64); }
+            (c.target_ecef, c.target_ecef.distance(start))
+        };
+        let a = run(60, false); let b = run(144, false); let diagonal = run(60, true);
+        assert!(a.0.distance(b.0) < 0.01);
+        assert!((a.1 - 500.0).abs() < 0.02);
+        assert!((a.1 - diagonal.1).abs() < 0.02);
+    }
+
+    #[test]
+    fn dragging_preserves_height_and_moves_ground_with_cursor() {
+        let mut c = navigation_camera(); let input = CameraController::new();
+        let before = input.ground_hit((640.0, 360.0), &c).unwrap();
+        input.pan_pixels((640.0, 360.0), (740.0, 410.0), &mut c);
+        let after = input.ground_hit((740.0, 410.0), &c).unwrap();
+        assert!(before.distance(after) < 0.02);
+        for _ in 0..1000 { let (right, _, _) = c.navigation_basis(); c.translate_surface(right * 100.0); }
+        let (_, _, height) = ecef_to_geodetic(c.target_ecef.x, c.target_ecef.y, c.target_ecef.z);
+        assert!((height - 40.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn cursor_anchored_zoom_and_focus_loss() {
+        let mut c = navigation_camera(); let mut input = CameraController::new();
+        input.last_mouse = Some((800.0, 450.0));
+        let before = input.ground_hit(input.last_mouse.unwrap(), &c).unwrap();
+        input.zoom(1.0, &mut c);
+        let after = input.ground_hit(input.last_mouse.unwrap(), &c).unwrap();
+        assert!(before.distance(after) < 0.02);
+        assert!(c.radius_m < 1000.0);
+        input.keys.insert(KeyCode::KeyW); input.pan_down = true; input.orbit_down = true;
+        input.release_event(&WindowEvent::Focused(false));
+        let before = c.target_ecef; input.update(&mut c, 0.1);
+        assert_eq!(c.target_ecef, before); assert!(!input.pan_down && !input.orbit_down);
+    }
+
+    #[test]
+    fn reverse_z_retains_depth_order_from_street_to_city_scale() {
+        let camera = navigation_camera();
+        let forward = (camera.target_ecef - camera.position_ecef).normalize().as_vec3();
+        let mut last = f32::INFINITY;
+        for distance in [0.1, 5.0, 100.0, 10_000.0, 150_000.0] {
+            let p = camera.view_proj_ecef() * (forward * distance).extend(1.0);
+            let z = p.z / p.w;
+            assert!(z > 0.0 && z < last);
+            assert!((z - 0.1 / distance).abs() < 1e-5);
+            last = z;
+        }
+    }
+
 }

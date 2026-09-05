@@ -55,3 +55,37 @@ fn cli_requires_georeferencing_and_preserves_cross_tile_points() {
     assert_eq!(bytes, fs::read(output.join("west.hypc")).unwrap());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn accepts_2025_bom_index_and_coordinate_filenames() {
+    let root = std::env::temp_dir().join(format!("hypc-2025-test-{}", std::process::id()));
+    let input = root.join("source");
+    let output = root.join("output");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(
+        input.join("3898_58196_-002.obj"),
+        "v 389872.7 5819778.5 35.5\n",
+    )
+    .unwrap();
+    let index = root.join("index.json");
+    fs::write(&index, "\u{feff}{\"type\":\"FeatureCollection\",\"features\":[{\"type\":\"Feature\",\"properties\":{\"url\":\"3898_58196_-002.zip\"},\"geometry\":{\"type\":\"Polygon\",\"coordinates\":[[[13.37,52.51],[13.38,52.51],[13.38,52.52],[13.37,52.52],[13.37,52.51]]]}}]}").unwrap();
+    let result = run(
+        &input,
+        &output,
+        &[
+            "--source-crs",
+            "EPSG:25833",
+            "--feature-index",
+            index.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let tile = hypc::read_file(output.join("3898_58196_-002.hypc")).unwrap();
+    assert_eq!(tile.points_units.len(), 1);
+    assert!(tile.geot.is_some());
+    fs::remove_dir_all(root).unwrap();
+}

@@ -28,7 +28,8 @@ pub struct TileUniformStd140 {
     pub viewport_size: [f32; 2],
     /// Base size of the point sprite in pixels.
     pub point_size_px: f32,
-    pub _pad2: f32,
+    /// World-space splat radius; zero retains fixed pixel point rendering.
+    pub splat_radius_m: f32,
 }
 
 /// A 32-byte, zero-padded UTF-8 tile identifier.

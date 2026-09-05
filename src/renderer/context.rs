@@ -35,7 +35,7 @@ impl GfxContext {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label:            Some("Device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features: adapter.features() & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
                     // Use default limits for broad compatibility.
                     required_limits:   wgpu::Limits::default(),
                 },
@@ -54,7 +54,7 @@ impl GfxContext {
 
         // Configure the surface.
         let config = wgpu::SurfaceConfiguration {
-            usage:                       wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage:                       wgpu::TextureUsages::RENDER_ATTACHMENT | (caps.usages & wgpu::TextureUsages::COPY_SRC),
             format:                      surface_format,
             width:                       size.width.max(1),
             height:                      size.height.max(1),

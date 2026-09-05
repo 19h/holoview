@@ -157,7 +157,7 @@ impl GroundGridPipeline {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_fmt,
                 depth_write_enabled: false, // Do not occlude points
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
