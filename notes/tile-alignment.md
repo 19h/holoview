@@ -1,5 +1,7 @@
 # Tile alignment: implementation and verification
 
+**Update:** The full-surface sampling stage documented below has been superseded by [detail-preserving sampling](detail-sampling.md). Coordinate, semantic and depth fixes remain in use. The figures and point counts below describe the previous full-surface dataset.
+
 The converter and renderer introduced several independent tile boundaries. The final implementation replaces the per-tile coordinate correction, mesh-vertex sampling, and per-tile semantic sampling. All 63 local HYPC files in `hypc`, `hypc2`, and `hypcx` have been regenerated and installed. The HYPC v2 representation remains compatible.
 
 [Before/after, identical camera and current renderer](alignment/before-after.png) · [Final colored render](alignment/final-after.png) · [49-tile geometry render](alignment/final-hypc2.png) · [8-tile geometry render](alignment/final-hypcx.png)
@@ -48,7 +50,7 @@ python3 scripts/rebuild_berlin_tiles.py \
   --dataset hypc --dataset hypc2 --dataset hypcx \
   --sources zips3 --sources zips2 --sources ../files/berlin_tiles \
   --feature-index crates/obj2hypc/mesh-index-2023.json \
-  --osm-pbf crates/obj2hypc/berlin-2025-08-24.osm.pbf --install
+  --osm-pbf crates/obj2hypc/berlin-2025-08-24.osm.pbf --sampling surface --install
 cargo run --release
 ```
 

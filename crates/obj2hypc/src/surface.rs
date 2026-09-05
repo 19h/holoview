@@ -84,6 +84,31 @@ pub fn sample(
     triangles: &[[usize; 3]],
     spacing_m: f64,
 ) -> Result<Vec<[f64; 3]>> {
+    sample_impl(vertices, triangles, spacing_m, None)
+}
+
+/// Retain source vertices on steep surfaces; fill only shallow triangles.
+/// This is a visualization policy, not inference of missing physical geometry.
+/// O(F + C + V) time, O(S + V) space before quantized deduplication.
+pub fn sample_detail(
+    vertices: &[[f64; 3]],
+    triangles: &[[usize; 3]],
+    spacing_m: f64,
+    max_fill_slope_deg: f64,
+) -> Result<Vec<[f64; 3]>> {
+    ensure!(
+        max_fill_slope_deg.is_finite() && (0.0..90.0).contains(&max_fill_slope_deg),
+        "Detail fill slope must be finite and in [0, 90) degrees"
+    );
+    sample_impl(vertices, triangles, spacing_m, Some(max_fill_slope_deg))
+}
+
+fn sample_impl(
+    vertices: &[[f64; 3]],
+    triangles: &[[usize; 3]],
+    spacing_m: f64,
+    max_fill_slope_deg: Option<f64>,
+) -> Result<Vec<[f64; 3]>> {
     ensure!(
         spacing_m.is_finite() && spacing_m >= 0.01,
         "Surface spacing must be at least 0.01 m"
@@ -104,6 +129,11 @@ pub fn sample(
         "Triangle index out of bounds"
     );
     let mut points = Vec::new();
+    let mut retain = if max_fill_slope_deg.is_some() {
+        vec![false; vertices.len()]
+    } else {
+        Vec::new()
+    };
     for &[ia, ib, ic] in triangles {
         let a = vertices[ia];
         let b = vertices[ib];
@@ -118,6 +148,21 @@ pub fn sample(
         let max_n = n.iter().map(|v| v.abs()).fold(0.0, f64::max);
         if max_n < 1e-14 {
             continue;
+        }
+        if let Some(slope) = max_fill_slope_deg {
+            let center: [f64; 3] = std::array::from_fn(|i| (a[i] + b[i] + c[i]) / 3.0);
+            let (lat, lon, _) = hypc::ecef_to_geodetic(center[0], center[1], center[2]);
+            let (slat, clat) = lat.to_radians().sin_cos();
+            let (slon, clon) = lon.to_radians().sin_cos();
+            let up = [clat * clon, clat * slon, slat];
+            let dot: f64 = (0..3).map(|i| n[i] * up[i]).sum();
+            let norm_sq: f64 = n.iter().map(|x| x * x).sum();
+            if dot * dot < norm_sq * slope.to_radians().cos().powi(2) {
+                for i in [ia, ib, ic] {
+                    retain[i] = true;
+                }
+                continue;
+            }
         }
         // Stable tie handling for equally inclined planes.
         let w = n
@@ -157,6 +202,12 @@ pub fn sample(
             }
         }
     }
+    points.extend(
+        vertices
+            .iter()
+            .zip(retain)
+            .filter_map(|(&p, keep)| keep.then_some(p)),
+    );
     ensure!(
         !points.is_empty(),
         "No surface samples at the requested spacing"
@@ -237,6 +288,55 @@ mod tests {
         );
         assert_eq!(one, cut);
         assert_eq!(one.len(), 400);
+    }
+
+    #[test]
+    fn detail_does_not_fill_vertical_closure_and_keeps_fine_vertices() {
+        // At the equator, +X is ellipsoidal up. A source facade can contain
+        // a closure triangle across a passage; detail mode must not densify it.
+        let vertices = [
+            [6_378_137.0, -3.0, 0.0],
+            [6_378_137.0, 3.0, 0.0],
+            [6_378_147.0, 3.0, 0.0],
+            [6_378_147.0, -3.0, 0.0],
+            [6_378_147.1, -2.9, 0.0], // detail smaller than the fill spacing
+        ];
+        let faces = [[0, 1, 2], [0, 2, 3], [0, 3, 4]];
+        let detail = lattice(sample_detail(&vertices, &faces, 0.5, 30.0).unwrap());
+        assert_eq!(detail, lattice(vertices.to_vec()));
+        assert!(sample(&vertices, &faces, 0.5).unwrap().len() > 100);
+        let reversed = [[2, 1, 0], [3, 2, 0], [4, 3, 0]];
+        assert_eq!(
+            detail,
+            lattice(sample_detail(&vertices, &reversed, 0.5, 30.0).unwrap())
+        );
+        assert!(sample_detail(&vertices, &faces, 0.5, 90.0).is_err());
+        assert!(sample_detail(&vertices, &faces, 0.5, f64::NAN).is_err());
+    }
+
+    #[test]
+    fn detail_keeps_shared_lattice_on_flat_tile_cuts() {
+        let p = |y, z| [6_378_137.0, y, z];
+        let vertices = [
+            p(0.0, 0.0),
+            p(10.0, 0.0),
+            p(10.0, 10.0),
+            p(0.0, 10.0),
+            p(4.37, 0.0),
+            p(4.37, 10.0),
+        ];
+        let whole = lattice(sample_detail(&vertices, &[[0, 1, 2], [0, 2, 3]], 0.5, 30.0).unwrap());
+        let cut = lattice(
+            sample_detail(
+                &vertices,
+                &[[0, 4, 5], [0, 5, 3], [4, 1, 2], [4, 2, 5]],
+                0.5,
+                30.0,
+            )
+            .unwrap(),
+        );
+        assert_eq!(whole.len(), 400);
+        assert_eq!(whole, cut);
     }
 
     #[test]

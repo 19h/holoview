@@ -56,6 +56,8 @@ impl std::fmt::Display for InputCs {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Sampling {
+    /// Preserve steep-surface vertices; fill shallow ground/roof triangles on the shared lattice.
+    Detail,
     /// Sample triangle interiors on a shared metric lattice; avoids tile-edge vertex-density artifacts.
     Surface,
     /// Preserve raw OBJ vertices (for point-only input or forensic comparison).
@@ -79,12 +81,16 @@ struct Args {
     #[arg(long, value_enum, default_value_t = InputCs::Auto)]
     input_cs: InputCs,
 
-    #[arg(long, value_enum, default_value_t = Sampling::Surface)]
+    #[arg(long, value_enum, default_value_t = Sampling::Detail)]
     sampling: Sampling,
 
     /// Global surface lattice spacing in metres (independent of tile extents).
     #[arg(long, default_value_t = 0.5)]
     surface_spacing_m: f64,
+
+    /// In detail mode, fill only triangles at or below this slope above local horizontal.
+    #[arg(long, default_value_t = 30.0)]
+    detail_max_fill_slope_deg: f64,
 
     /// Shared horizontal CRS for projected OBJ coordinates (e.g. EPSG:25833).
     #[arg(long)]
@@ -1286,12 +1292,12 @@ fn process_one_mesh(
         debug!("Found OBJ file in ZIP: {}", obj_name);
         let mut obj_file = archive.by_name(&obj_name)?;
 
-        surface::read_obj(&mut obj_file, matches!(args.sampling, Sampling::Surface))?
+        surface::read_obj(&mut obj_file, !matches!(args.sampling, Sampling::Vertices))?
     } else {
         debug!("Opening OBJ file directly");
         surface::read_obj(
             File::open(path)?,
-            matches!(args.sampling, Sampling::Surface),
+            !matches!(args.sampling, Sampling::Vertices),
         )?
     };
 
@@ -1420,10 +1426,16 @@ fn process_one_mesh(
     let source_vertices = points_m.len();
     let points_m = match args.sampling {
         Sampling::Vertices => points_m,
+        Sampling::Detail => surface::sample_detail(
+            &points_m,
+            &triangles,
+            args.surface_spacing_m,
+            args.detail_max_fill_slope_deg,
+        )?,
         Sampling::Surface => surface::sample(&points_m, &triangles, args.surface_spacing_m)?,
     };
     let mut q = quantize_with_anchor(&points_m, args.units_per_meter)?;
-    if matches!(args.sampling, Sampling::Surface) {
+    if !matches!(args.sampling, Sampling::Vertices) {
         q.points_units.sort_unstable();
         q.points_units.dedup();
     }
@@ -1548,11 +1560,12 @@ fn process_one_mesh(
     debug!("Writing HYPC tile to {}", out_path.display());
     hypc::write_file(&out_path, &tile)?;
     let provenance = serde_json::json!({
-        "converter": "obj2hypc/shared-crs-surface-v2",
+        "converter": "obj2hypc/shared-crs-detail-v3",
+        "detail_max_fill_slope_deg": if matches!(args.sampling, Sampling::Detail) { Some(args.detail_max_fill_slope_deg) } else { None },
         "sampling": format!("{:?}", args.sampling),
         "source_vertices": source_vertices,
         "source_triangles": triangles.len(),
-        "surface_spacing_m": if matches!(args.sampling, Sampling::Surface) { Some(args.surface_spacing_m) } else { None },
+        "surface_spacing_m": if !matches!(args.sampling, Sampling::Vertices) { Some(args.surface_spacing_m) } else { None },
         "source_path": path,
         "input_cs": cs.to_string(),
         "horizontal_source_crs": args.source_crs,

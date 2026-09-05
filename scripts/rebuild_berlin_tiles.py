@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerate supplied Berlin OBJ tiles with one EPSG:25833 transform.
 
-Stages vertex references and uniform surface samples, rebuilds geographic masks,
+Stages vertex references and selected mesh samples, rebuilds geographic masks,
 checks independent cs2cs
 control samples, and optionally installs with byte-exact backups. Does not infer
 registration or the source vertical datum. Requires numpy/scipy, PROJ cs2cs,
@@ -61,6 +61,8 @@ def main():
     ap.add_argument('--converter', type=Path, default=Path('crates/obj2hypc/target/release/obj2hypc'))
     ap.add_argument('--osm-pbf', type=Path, required=True)
     ap.add_argument('--surface-spacing-m', type=float, default=0.5)
+    ap.add_argument('--sampling', choices=['detail', 'surface'], default='detail')
+    ap.add_argument('--detail-max-fill-slope-deg', type=float, default=30.0)
     ap.add_argument('--install', action='store_true')
     args = ap.parse_args()
     args.stage.mkdir(parents=True, exist_ok=True)
@@ -73,7 +75,7 @@ def main():
         source_dir = stage / 'sources'
         fixed_dir = stage / 'fixed'
         backup_dir = stage / 'original'
-        surface_dir = stage / 'surface'
+        surface_dir = stage / args.sampling
         source_dir.mkdir(parents=True, exist_ok=True)
         fixed_dir.mkdir(parents=True, exist_ok=True)
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -85,7 +87,8 @@ def main():
             if backup.exists():
                 assert digest(original) == digest(backup) or ((fixed_dir / original.name).exists()
                     and digest(original) == digest(fixed_dir / original.name)) or (
-                    (surface_dir / original.name).exists() and digest(original) == digest(surface_dir / original.name))
+                    any((stage / mode / original.name).exists() and digest(original) == digest(stage / mode / original.name)
+                        for mode in ['surface', 'detail']))
             else:
                 shutil.copy2(original, backup)
             upm = struct.unpack_from('<I', backup.read_bytes(), 16)[0]
@@ -140,11 +143,12 @@ def main():
         for upm in upms:
             subprocess.run([str(args.converter.resolve()), '--input-dir', str(stage / f'sources-{upm}'),
                             '--output-dir', str(surface_dir), '--input-cs', 'projected',
-                            '--source-crs', 'EPSG:25833', '--sampling', 'surface',
+                            '--source-crs', 'EPSG:25833', '--sampling', args.sampling,
+                            '--detail-max-fill-slope-deg', str(args.detail_max_fill_slope_deg),
                             '--surface-spacing-m', str(args.surface_spacing_m), '--units-per-meter', str(upm),
                             '--feature-index', str(args.feature_index), '--osm-pbf', str(args.osm_pbf),
                             '--overwrite'], check=True, env=env)
-        audit = stage / 'surface-audit.json'
+        audit = stage / (args.sampling + '-audit.json')
         subprocess.run([sys.executable, str(Path(__file__).with_name('audit_surface.py')),
                         '--source', str(source_dir), '--reference', str(fixed_dir),
                         '--surface', str(surface_dir), '--cache', str(stage/'cache'),
@@ -154,6 +158,8 @@ def main():
         for row in manifest:
             if row['dataset'] == str(dataset):
                 result = verified[row['tile']]
+                row['sampling'] = args.sampling
+                row['detail_max_fill_slope_deg'] = args.detail_max_fill_slope_deg if args.sampling == 'detail' else None
                 row['surface_points'] = result['surface_points']
                 row['surface_samples_checked'] = result['samples']
                 row['max_surface_distance_m'] = result['max_surface_distance_m']
@@ -162,7 +168,7 @@ def main():
                 row['semantic_source_sha256'] = semantic_source_sha256
                 row['semantic_labels'] = 'direct labels on shared global cells'
         subprocess.run([sys.executable, str(Path(__file__).with_name('audit_label_cells.py')),
-                        '--tiles', str(surface_dir), '--output', str(stage/'label-cells-audit.json')], check=True)
+                        '--tiles', str(surface_dir), '--output', str(stage/(args.sampling + '-label-cells-audit.json'))], check=True)
         # Install only after the whole dataset passed geometry and shared-label controls.
 
         if args.install:
@@ -172,7 +178,7 @@ def main():
                 shutil.copy2(fixed, temp)
                 temp.replace(original)
                 shutil.copy2(fixed.with_suffix('.provenance.json'), original.with_suffix('.provenance.json'))
-    (args.stage / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    (args.stage / (args.sampling + '-manifest.json')).write_text(json.dumps(manifest, indent=2) + '\n')
 
 
 if __name__ == '__main__':

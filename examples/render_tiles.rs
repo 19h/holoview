@@ -55,10 +55,10 @@ fn main() -> Result<()> {
     // latitude longitude ellipsoidal_height_m radius_m azimuth_deg.
     if args.len() > 5 {
         anyhow::ensure!(
-            args.len() == 10,
-            "Expected five pose values: lat lon height radius azimuth"
+            args.len() == 10 || args.len() == 11,
+            "Expected lat lon height radius azimuth [point_radius_px]"
         );
-        let pose = args[5..]
+        let pose = args[5..10]
             .iter()
             .map(|v| v.parse::<f64>())
             .collect::<Result<Vec<_>, _>>()?;
@@ -77,10 +77,15 @@ fn main() -> Result<()> {
             params.debug_mode = 2;
         }
     }
+    let point_radius: f32 = args.get(10).map_or(Ok(0.65), |v| v.parse())?;
+    anyhow::ensure!(
+        point_radius.is_finite() && point_radius > 0.0,
+        "Point radius must be positive and finite"
+    );
     let pixels = if mode == "raw" {
-        gpu.render(&tiles, &camera, 0.65)?
+        gpu.render(&tiles, &camera, point_radius)?
     } else {
-        gpu.render_with_post(&tiles, &camera, 0.65, Some(params))?
+        gpu.render_with_post(&tiles, &camera, point_radius, Some(params))?
     };
     anyhow::ensure!(pixels.chunks_exact(4).any(|p| p[3] != 0), "Empty render");
     if let Some(parent) = Path::new(output).parent() {
