@@ -12,7 +12,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_
     if all(id.xy < size) {
         let a = textureLoad(raw_depth, vec2<i32>(id.xy), 0);
         let b = textureLoad(display_depth, vec2<i32>(id.xy), 0);
-        if a.a > 0.5 && a.r > 0.0 { atomicAdd(&raw_count, 1u); }
+        if a.a > 0.5 && a.a < 1.5 && a.r > 0.0 { atomicAdd(&raw_count, 1u); }
         if b.a > 0.5 && b.r > 0.0 { atomicAdd(&display_count, 1u); }
     }
     workgroupBarrier();

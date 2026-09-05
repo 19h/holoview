@@ -1,4 +1,4 @@
-//! Optional GPU coverage and timestamp instrumentation. Three asynchronous
+//! Optional GPU coverage and timestamp instrumentation. Eight asynchronous
 //! readbacks avoid synchronizing normal rendering with CPU measurements.
 use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
 
@@ -7,7 +7,9 @@ pub struct ProbeSample {
     pub frame: u64,
     pub raw_pixels: u32,
     pub display_pixels: u32,
-    pub gpu_ms: Option<f64>,
+    pub geometry_gpu_ms: Option<f64>,
+    pub timestamp_ticks: [u64; 2],
+    pub timestamp_period_ns: f32,
 }
 struct Slot { buffer: wgpu::Buffer, state: Arc<AtomicU8>, frame: u64 }
 pub struct FrameProbe {
@@ -16,7 +18,7 @@ pub struct FrameProbe {
     bind_filled: wgpu::BindGroup,
     bind_raw: wgpu::BindGroup,
     counts: wgpu::Buffer,
-    query: Option<wgpu::QuerySet>,
+    query: Option<Vec<wgpu::QuerySet>>,
     resolve: wgpu::Buffer,
     slots: Vec<Slot>,
     period_ns: f32,
@@ -39,10 +41,10 @@ impl FrameProbe {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Coverage probe"), source: wgpu::ShaderSource::Wgsl(include_str!("../../shaders/coverage.wgsl").into()) });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Coverage probe"), bind_group_layouts: &[&layout], push_constant_ranges: &[] });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("Coverage probe"), layout: Some(&pipeline_layout), module: &module, entry_point: "main", compilation_options: Default::default() });
-        let query = device.features().contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS).then(|| device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("Frame timestamps"), ty: wgpu::QueryType::Timestamp, count: 6 }));
+        let query = device.features().contains(wgpu::Features::TIMESTAMP_QUERY).then(|| (0..8).map(|_| device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("Frame timestamps"), ty: wgpu::QueryType::Timestamp, count: 2 })).collect());
         let resolve = device.create_buffer(&wgpu::BufferDescriptor { label: Some("Frame timestamp resolve"), size: 256,
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-        let slots = (0..3).map(|_| Slot { buffer: device.create_buffer(&wgpu::BufferDescriptor { label: Some("Frame probe readback"), size: 32,
+        let slots = (0..8).map(|_| Slot { buffer: device.create_buffer(&wgpu::BufferDescriptor { label: Some("Frame probe readback"), size: 32,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }), state: Arc::new(AtomicU8::new(0)), frame: 0 }).collect();
         Self { pipeline, layout, bind_filled, bind_raw, counts, query, resolve, slots, period_ns: queue.get_timestamp_period(), samples: vec![], skipped: 0, size }
     }
@@ -68,7 +70,8 @@ impl FrameProbe {
                 let a = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
                 let b = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
                 self.samples.push(ProbeSample { frame: slot.frame, raw_pixels: raw, display_pixels: display,
-                    gpu_ms: self.query.as_ref().map(|_| b.saturating_sub(a) as f64 * self.period_ns as f64 * 1e-6) });
+                    geometry_gpu_ms: (self.query.is_some() && b > a && self.period_ns > 0.0).then_some(b.saturating_sub(a) as f64 * self.period_ns as f64 * 1e-6),
+                    timestamp_ticks: [a,b], timestamp_period_ns: self.period_ns });
                 drop(bytes); slot.buffer.unmap(); slot.state.store(0, Ordering::Release);
             } else if state == 3 {
                 log::error!("GPU probe readback failed for frame {}", slot.frame);
@@ -76,16 +79,21 @@ impl FrameProbe {
             }
         }
     }
+    pub fn has_available_slot(&self) -> bool { self.slots.iter().any(|s| s.state.load(Ordering::Acquire) == 0) }
     pub fn begin(&mut self, encoder: &mut wgpu::CommandEncoder, frame: u64) -> Option<usize> {
         let Some(index) = self.slots.iter().position(|s| s.state.load(Ordering::Acquire) == 0) else { self.skipped += 1; return None; };
         self.slots[index].frame = frame;
-        if let Some(query) = &self.query { encoder.write_timestamp(query, index as u32 * 2); }
+        let _ = encoder; // timestamps are attached to the geometry render pass
         Some(index)
+    }
+    pub fn timestamp_writes(&self, index: usize) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        self.query.as_ref().map(|queries| wgpu::RenderPassTimestampWrites {
+            query_set: &queries[index], beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1),
+        })
     }
     pub fn end(&self, encoder: &mut wgpu::CommandEncoder, index: usize, filled: bool) {
         if let Some(query) = &self.query {
-            encoder.write_timestamp(query, index as u32 * 2 + 1);
-            encoder.resolve_query_set(query, index as u32 * 2..index as u32 * 2 + 2, &self.resolve, 0);
+            encoder.resolve_query_set(&query[index], 0..2, &self.resolve, 0);
             encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.slots[index].buffer, 16, 16);
         }
         encoder.clear_buffer(&self.counts, 0, None);

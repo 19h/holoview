@@ -35,7 +35,7 @@ impl GfxContext {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label:            Some("Device"),
-                    required_features: adapter.features() & (wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+                    required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                     // Use default limits for broad compatibility.
                     required_limits:   wgpu::Limits::default(),
                 },

@@ -63,6 +63,8 @@ pub struct Dataset {
     pub packed_bytes: u64,
     pub root: u32,
     pub nodes: Vec<Node>,
+    #[serde(default)]
+    pub terrain: Option<super::terrain::TerrainGrid>,
 }
 
 impl Dataset {
@@ -75,6 +77,7 @@ impl Dataset {
         ensure!(pack.metadata()?.len() == data.packed_bytes, "Truncated/changed LOD pack");
         let mut magic = [0; 8]; pack.read_exact(&mut magic)?;
         ensure!(&magic == MAGIC, "Invalid LOD pack signature");
+        if let Some(terrain) = &data.terrain { terrain.validate()?; }
         let mut references = vec![0u8; data.nodes.len()];
         let mut source_count = 0;
         let mut source_points = 0u64;
@@ -312,13 +315,14 @@ pub fn prepare_dataset(root: &Path, cache: &Path, workers: usize) -> Result<Data
     log::info!("Building spatial hierarchy from {} leaves", leaves.len());
     let mut reader = File::open(&pack_temp)?;
     let root_id = parent_tree(&mut nodes, &mut leaves, &mut writer, &mut reader)?;
-    let data = Dataset { version: VERSION, source_root: root, source_tiles: sources.len(), source_points,
-        packed_bytes: writer.stream_position()?, root: root_id, nodes };
+    let mut data = Dataset { version: VERSION, source_root: root, source_tiles: sources.len(), source_points,
+        packed_bytes: writer.stream_position()?, root: root_id, nodes, terrain: None };
     writer.sync_all()?;
     fs::rename(pack_temp, cache.join("points.bin"))?;
+    data.terrain = Some(super::terrain::build_terrain(&data, cache)?);
     let catalog_temp = cache.join("catalog.json.part");
     serde_json::to_writer(File::create(&catalog_temp)?, &data)?;
-    fs::rename(catalog_temp, cache.join("catalog.json"))?;
+    fs::rename(&catalog_temp, cache.join("catalog.json"))?;
     let verified = Dataset::open(cache)?;
     let status = serde_json::json!({"phase":"complete", "tiles":data.source_tiles,"source_points":data.source_points,"nodes":data.nodes.len(),"packed_bytes":data.packed_bytes,"elapsed_s":started.elapsed().as_secs_f64()});
     serde_json::to_writer_pretty(File::create(cache.join("build-status.json"))?, &status)?;

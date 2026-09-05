@@ -30,7 +30,7 @@ fn options() -> Result<Options> {
                 result.pose = Some(pose);
             }
             "--help" | "-h" => {
-                println!("Holographic City Viewer\nUsage: holographic_viewer [--dataset] DIRECTORY\n\nOpen a prepared city catalog or HYPC folder.\nDrag/WASD/arrows: pan; right-drag/QE: rotate; RF/PageUp/PageDown: tilt; wheel/+/-: zoom.\nShift-drag: orbit. Shift+movement: faster. F12: save a frame.\n\nVerification options:\n  --frames N --report report.json --capture final.png\n  --pose lat,lon,height_m,radius_m,azimuth_deg,elevation_deg\n  --tour  (reproducible 900-frame city/close-up/navigation route)");
+                println!("Holographic City Viewer\nUsage: holographic_viewer [--dataset] DIRECTORY\n\nOpen a prepared city catalog or HYPC folder.\nDrag/WASD/arrows: pan; Cmd/Ctrl/right/middle-drag/QE: orbit; RF/PageUp/PageDown: tilt; wheel/+/-: zoom.\nShift-drag: orbit. Shift+movement: faster. F12: save a frame.\n\nVerification options:\n  --frames N --report report.json --capture final.png\n  --pose lat,lon,height_m,radius_m,azimuth_deg,elevation_deg\n  --tour  (reproducible 900-frame city/close-up/navigation route)");
                 std::process::exit(0);
             }
             _ if !arg.starts_with('-') && result.dataset.is_none() => result.dataset = Some(arg.into()),
@@ -102,6 +102,7 @@ fn report(app: &mut App, path: &std::path::Path) -> Result<()> {
     let value = serde_json::json!({
         "viewport":[app.renderer.gfx.size.width, app.renderer.gfx.size.height],
         "frames":app.metrics.len(), "frame_ms_p50":percentile(0.5), "frame_ms_p95":percentile(0.95), "frame_ms_p99":percentile(0.99),
+        "terrain_gpu_bytes":app.renderer.terrain.as_ref().map(|t| t.bytes),
         "samples":app.metrics,
         "gpu_probe":app.renderer.probe.as_ref().map(|p| &p.samples),
         "gpu_probe_skipped":app.renderer.probe.as_ref().map(|p| p.skipped),
@@ -125,6 +126,7 @@ fn main() -> Result<()> {
     }
     if let Some(p) = options.pose { pose(&mut app, p); }
     app.record_metrics = options.report.is_some();
+    app.automated_navigation = options.tour || options.stress;
     if options.verify_coverage {
         let renderer = &mut app.renderer;
         renderer.probe = Some(holographic_viewer::renderer::probe::FrameProbe::new(&renderer.gfx.device, &renderer.gfx.queue,

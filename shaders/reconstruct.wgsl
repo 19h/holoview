@@ -21,7 +21,7 @@ fn support(p: vec2<i32>, direction: vec2<i32>) -> Support {
     for (var distance = 1; distance <= 8; distance *= 2) {
         let q = p + direction * distance;
         let d = sample_depth(q);
-        if d.a > 0.5 && d.r > 0.0 {
+        if d.a > 0.5 && d.a < 1.5 && d.r > 0.0 {
             found.depth = d; found.distance = f32(distance); found.pixel = q; return found;
         }
     }
@@ -32,7 +32,7 @@ fn support(p: vec2<i32>, direction: vec2<i32>) -> Support {
     let original = sample_depth(p);
     var out: Out;
     out.color = textureLoad(color_tex, p, 0); out.depth = original;
-    if original.a > 0.5 && original.r > 0.0 {
+    if original.a > 0.5 && original.a < 1.5 && original.r > 0.0 {
         // Bilateral shading depth: smooth subpixel splat steps without blending
         // across a foreground/background discontinuity or semantic boundary.
         var sum = original.r * 4.0; var weight = 4.0;
@@ -43,7 +43,7 @@ fn support(p: vec2<i32>, direction: vec2<i32>) -> Support {
             if axis == 2 { direction = vec2<i32>(0, 1); }
             if axis == 3 { direction = vec2<i32>(0, -1); }
             let d = sample_depth(p + direction);
-            if d.a > 0.5 && abs(d.r - original.r) < limit && d.g == original.g {
+            if d.a > 0.5 && d.a < 1.5 && abs(d.r - original.r) < limit && d.g == original.g {
                 sum += d.r; weight += 1.0;
             }
         }

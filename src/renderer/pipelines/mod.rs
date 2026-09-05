@@ -5,3 +5,4 @@ pub mod hologram;
 pub mod post_stack;
 
 pub mod reconstruct;
+pub mod terrain;

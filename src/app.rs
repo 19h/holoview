@@ -26,6 +26,8 @@ pub struct App {
     pub capture_next: Option<PathBuf>,
     pub record_metrics: bool,
     pub metrics: Vec<serde_json::Value>,
+    focused: bool,
+    pub automated_navigation: bool,
     last_frame: std::time::Instant,
 }
 
@@ -73,6 +75,8 @@ impl App {
             capture_next: None,
             record_metrics: false,
             metrics: Vec::new(),
+            focused: true,
+            automated_navigation: false,
             last_frame: std::time::Instant::now(),
         })
     }
@@ -94,15 +98,13 @@ impl App {
 
     pub fn handle_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
         let response = self.egui_state.on_window_event(window, event);
-        if matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } | WindowEvent::Focused(_)) {
-            log::debug!("Navigation event {event:?}; UI consumed={}", response.consumed);
-        }
+        if let WindowEvent::Focused(focused) = event { self.focused = *focused; }
         self.camera_controller.release_event(event);
         if response.consumed {
             return true;
         }
 
-        self.camera_controller.handle_event(event, &mut self.camera);
+        if !self.automated_navigation { self.camera_controller.handle_event(event, &mut self.camera); }
 
         if let WindowEvent::Resized(physical_size) = event {
             self.resize(*physical_size);
@@ -142,9 +144,11 @@ impl App {
             [self.renderer.gfx.size.width as f32, self.renderer.gfx.size.height as f32])?;
         log::info!("Opened {} source tiles / {} points / {} LOD nodes; pinned {} bytes",
             scene.dataset.source_tiles, scene.dataset.source_points, scene.dataset.nodes.len(), scene.stats.gpu_bytes);
-        log::info!("Dataset opened in {:.3} s", opened.elapsed().as_secs_f64());
+        self.renderer.terrain = scene.dataset.terrain.as_ref().map(|t|
+            crate::renderer::pipelines::terrain::TerrainGpu::new(&self.renderer.gfx.device, &self.renderer.holo.tile_layout, t)).transpose()?;
         self.scene = Some(scene);
         self.fit_dataset();
+        log::info!("Dataset activated in {:.3} s", opened.elapsed().as_secs_f64());
         self.loading_path = None;
         self.last_frame = std::time::Instant::now();
         Ok(())
@@ -155,7 +159,8 @@ impl App {
             let root = &scene.dataset.nodes[scene.dataset.root as usize];
             self.camera.azimuth_rad = std::f64::consts::PI;
             self.camera.elevation_rad = 70f64.to_radians();
-            self.camera.set_target_and_radius(root.center().into(), 5000.0);
+            let center = scene.dataset.terrain.as_ref().and_then(|t| t.ground(root.center()).map(|p| p + glam::DVec3::from(t.up) * 0.75)).unwrap_or(root.center());
+            self.camera.set_target_and_radius(center.into(), 5000.0);
             let rotation = self.camera.view_ecef();
             let tx = (self.camera.proj.x_axis.x as f64).recip();
             let ty = (self.camera.proj.y_axis.y as f64).recip();
@@ -235,6 +240,10 @@ impl App {
         self.frame_ms = self.frame_ms * 0.9 + dt.min(0.1) * 100.0;
         self.camera_controller.update(&mut self.camera, dt);
         self.last_frame = now;
+        if let Some(scene) = &mut self.scene {
+            scene.frame_feedback(dt * 1000.0, self.focused);
+            scene.constrain_camera(&mut self.camera, self.camera_controller.is_panning(), dt);
+        }
         let frame = self.renderer.gfx.surface.get_current_texture()?;
         let swap_view = frame
             .texture

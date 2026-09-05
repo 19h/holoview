@@ -28,6 +28,8 @@ pub struct Renderer {
     pub draw_uniforms: DrawUniforms,
     pub reconstruction: Reconstruction,
     pub probe: Option<probe::FrameProbe>,
+    pub terrain: Option<pipelines::terrain::TerrainGpu>,
+    terrain_pipeline: pipelines::terrain::TerrainPipeline,
     frame_number: u64,
 }
 
@@ -51,6 +53,7 @@ impl Renderer {
         );
         let post_stack = PostStack::new(&gfx.device, gfx.config.format, size.width, size.height);
 
+        let terrain_pipeline = pipelines::terrain::TerrainPipeline::new(&gfx.device, &holo.tile_layout, &targets);
         let reconstruction = Reconstruction::new(&gfx.device, size, &targets);
         let draw_uniforms = DrawUniforms::new(&gfx.device, &holo.tile_layout, 2048);
         let egui_renderer = egui_wgpu::Renderer::new(&gfx.device, gfx.config.format, None, 1);
@@ -65,6 +68,8 @@ impl Renderer {
             draw_uniforms,
             reconstruction,
             probe: None,
+            terrain: None,
+            terrain_pipeline,
             frame_number: 0,
         })
     }
@@ -95,8 +100,12 @@ impl Renderer {
                 label: Some("Frame Encoder"),
             });
 
+        if let Some(terrain) = &self.terrain { terrain.update(&self.gfx.queue, camera, [self.gfx.size.width as f32, self.gfx.size.height as f32]); }
         let probe_slot = self.probe.as_mut().and_then(|probe| {
             probe.poll(&self.gfx.device, false);
+            // Verification must cover every frame. This wait only occurs if all
+            // readback slots are busy, and the probe is disabled in normal use.
+            if !probe.has_available_slot() { probe.poll(&self.gfx.device, true); }
             probe.begin(&mut encoder, self.frame_number)
         });
         self.frame_number += 1;
@@ -141,7 +150,7 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: probe_slot.and_then(|slot| self.probe.as_ref().unwrap().timestamp_writes(slot)),
                 occlusion_query_set: None,
             });
 
@@ -154,6 +163,8 @@ impl Renderer {
                     self.post_stack.params.grid_utm_align,
                 );
             }
+
+            if let Some(terrain) = &self.terrain { self.terrain_pipeline.draw(&mut pass, terrain); }
 
             // Draw all point cloud tiles
             for (index, (tile, _)) in draws.iter().enumerate() {

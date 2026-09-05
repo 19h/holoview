@@ -212,6 +212,7 @@ pub struct CameraController {
     last_mouse: Option<(f64, f64)>,
     viewport: [f64; 2],
     keys: HashSet<KeyCode>,
+    modifiers: winit::keyboard::ModifiersState,
 }
 
 impl Default for CameraController {
@@ -222,7 +223,7 @@ impl CameraController {
     pub fn new() -> Self {
         Self {
             pan_down: false, orbit_down: false, last_mouse: None,
-            viewport: [1280.0, 720.0], keys: HashSet::new(),
+            viewport: [1280.0, 720.0], keys: HashSet::new(), modifiers: Default::default(),
         }
     }
 
@@ -230,12 +231,14 @@ impl CameraController {
         self.viewport = [width.max(1) as f64, height.max(1) as f64];
     }
 
-    /// Always forward releases and focus loss, even when UI owns the input.
+    /// Always forward modifiers, releases and focus loss, even when UI owns input.
     pub fn release_event(&mut self, event: &WindowEvent) {
         match event {
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Focused(false) => {
                 self.keys.clear(); self.pan_down = false; self.orbit_down = false;
                 self.last_mouse = None;
+                self.modifiers = Default::default();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
                 if let PhysicalKey::Code(key) = event.physical_key { self.keys.remove(&key); }
@@ -266,7 +269,7 @@ impl CameraController {
             WindowEvent::CursorMoved { position, .. } => {
                 let xy = (position.x, position.y);
                 if let Some(last) = self.last_mouse {
-                    if self.orbit_down || (self.pan_down && self.shift()) {
+                    if self.orbit_down || (self.pan_down && (self.shift() || self.orbit_modifier())) {
                         camera.azimuth_rad -= (xy.0 - last.0) * 0.004;
                         camera.elevation_rad += (xy.1 - last.1) * 0.004;
                         Self::clamp_angles(camera);
@@ -287,8 +290,19 @@ impl CameraController {
         }
     }
 
+    pub fn is_panning(&self) -> bool {
+        (self.pan_down && !self.orbit_down && !self.shift() && !self.orbit_modifier()) ||
+            [KeyCode::KeyW, KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD,
+             KeyCode::ArrowUp, KeyCode::ArrowDown, KeyCode::ArrowLeft, KeyCode::ArrowRight].iter().any(|k| self.keys.contains(k))
+    }
+
+    fn orbit_modifier(&self) -> bool {
+        self.modifiers.control_key() || self.modifiers.super_key() ||
+            [KeyCode::ControlLeft, KeyCode::ControlRight, KeyCode::SuperLeft, KeyCode::SuperRight].iter().any(|k| self.keys.contains(k))
+    }
+
     fn shift(&self) -> bool {
-        self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight)
+        self.modifiers.shift_key() || self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight)
     }
 
     fn axis(&self, positive: &[KeyCode], negative: &[KeyCode]) -> f64 {
@@ -462,6 +476,17 @@ mod tests {
             assert!(z > 0.0 && z < last);
             assert!((z - 0.1 / distance).abs() < 1e-5);
             last = z;
+        }
+    }
+
+    #[test]
+    fn command_and_control_drag_select_orbit_without_ground_panning() {
+        for modifier in [winit::keyboard::ModifiersState::SUPER, winit::keyboard::ModifiersState::CONTROL] {
+            let mut controller = CameraController::new();
+            controller.pan_down = true; controller.modifiers = modifier;
+            assert!(controller.orbit_modifier()); assert!(!controller.is_panning());
+            controller.release_event(&WindowEvent::Focused(false));
+            assert!(!controller.orbit_modifier());
         }
     }
 

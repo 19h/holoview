@@ -13,3 +13,5 @@ pub use self::types::{PointInstance, TileGpu, TileKey32, TileUniformStd140};
 
 pub mod dataset;
 pub mod streaming;
+pub mod terrain;
+pub mod frame_budget;

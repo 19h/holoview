@@ -25,6 +25,7 @@ impl Default for StreamConfig {
 
 #[derive(Default, Clone, Debug, serde::Serialize)]
 pub struct StreamStats {
+    pub effective_point_budget: u64,
     pub source_tiles: usize,
     pub source_points: u64,
     pub visible_points: u64,
@@ -192,6 +193,7 @@ pub struct StreamScene {
     previous_refined: HashSet<u32>,
     last_radius: f64,
     zoom_velocity: f64,
+    frame_budget: super::frame_budget::FrameBudget,
 }
 
 impl StreamScene {
@@ -219,9 +221,10 @@ impl StreamScene {
                 }
             })?;
         }
+        let frame_budget = super::frame_budget::FrameBudget::new(config.point_budget);
         let mut scene = Self { dataset, config, stats: StreamStats::default(), resident: HashMap::new(), resident_ids: HashSet::new(),
             request: Some(send), completed, needed, inflight: HashSet::new(), ready: VecDeque::new(), failures: HashMap::new(), draw_ids: vec![], frame: 0,
-            last_target: camera.target_ecef, velocity: glam::DVec3::ZERO, last_update: Instant::now(), previous_refined: HashSet::new(), last_radius: camera.radius_m, zoom_velocity: 0.0 };
+            last_target: camera.target_ecef, velocity: glam::DVec3::ZERO, last_update: Instant::now(), previous_refined: HashSet::new(), last_radius: camera.radius_m, zoom_velocity: 0.0, frame_budget };
         // A small breadth-first overview is permanently resident. Startup never
         // touches finest-level HYPC and its byte cost is independent of city size.
         let mut queue = VecDeque::from([scene.dataset.root]);
@@ -259,7 +262,11 @@ impl StreamScene {
     pub fn update(&mut self, camera: &Camera, viewport: [f32; 2], device: &wgpu::Device, layout: &wgpu::BindGroupLayout) {
         let start = Instant::now();
         self.frame += 1;
-        let selected = select_view(&self.dataset, &View::new(camera, viewport, 1.0), &self.config, Some(&self.previous_refined));
+        let mut effective = self.config.clone();
+        effective.point_budget = self.frame_budget.current().min(self.config.point_budget)
+            .max(self.dataset.nodes[self.dataset.root as usize].points as u64);
+        self.stats.effective_point_budget = effective.point_budget;
+        let selected = select_view(&self.dataset, &View::new(camera, viewport, 1.0), &effective, Some(&self.previous_refined));
         self.previous_refined.clone_from(&selected.refined);
         self.stats.selection_ms = start.elapsed().as_secs_f64() * 1000.0;
         let dt = start.duration_since(self.last_update).as_secs_f64().clamp(0.001, 0.1);
@@ -278,8 +285,8 @@ impl StreamScene {
         predicted.update();
         let lookahead = self.velocity * 0.3;
         if lookahead.length() < camera.radius_m * 2.0 { predicted.translate_surface(lookahead); }
-        let mut prefetch_config = self.config.clone();
-        prefetch_config.point_budget = if self.zoom_velocity < -0.2 { self.config.point_budget } else { (self.config.point_budget / 3).max(100_000) };
+        let mut prefetch_config = effective.clone();
+        prefetch_config.point_budget = if self.zoom_velocity < -0.2 { effective.point_budget } else { (effective.point_budget / 3).max(100_000) };
         prefetch_config.target_spacing_px *= if self.zoom_velocity < -0.2 { 1.0 } else { 1.6 };
         let prefetch = select_view(&self.dataset, &View::new(&predicted, viewport, 1.35), &prefetch_config, None);
         wanted.extend(prefetch.leaves.union(&prefetch.refined).copied());
@@ -323,7 +330,7 @@ impl StreamScene {
             uploaded += bytes;
         }
         self.stats.uploaded_bytes = uploaded;
-        let (draws, mut requests) = bounded_resident_cut(&self.dataset, &selected, &self.resident_ids, camera, viewport, &self.config);
+        let (draws, mut requests) = bounded_resident_cut(&self.dataset, &selected, &self.resident_ids, camera, viewport, &effective);
         self.stats.refinement_pending = requests.len();
         let (_, prefetch_requests) = resident_cut(&self.dataset, &prefetch, &self.resident_ids, &predicted, viewport);
         let view = View::new(camera, viewport, 1.0);
@@ -347,6 +354,27 @@ impl StreamScene {
         self.stats.pending_bytes = pending_bytes;
         self.stats.failures = self.failures.len();
         self.stats.update_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    pub fn frame_feedback(&mut self, frame_ms: f64, foreground: bool) {
+        self.frame_budget.observe(frame_ms, foreground, self.config.point_budget);
+    }
+
+    /// Navigation uses only the resident height grid. Ground support is
+    /// approximate; it shares the source's unmodified vertical reference.
+    pub fn constrain_camera(&self, camera: &mut Camera, follow_ground: bool, dt: f64) {
+        let Some(terrain) = &self.dataset.terrain else { return; };
+        let up = glam::DVec3::from(terrain.up);
+        if let Some(ground) = terrain.ground(camera.target_ecef) {
+            let offset = (ground + up * 0.75 - camera.target_ecef).dot(up);
+            let correction = if offset > 0.0 { offset } else if follow_ground { offset * (1.0 - (-dt.clamp(0.0, 0.1) / 0.12).exp()) } else { 0.0 };
+            if correction.abs() > 1e-5 { camera.target_ecef += up * correction; camera.update(); }
+        }
+        let eye = glam::DVec3::from(camera.ecef_m());
+        if let Some(ground) = terrain.ground(eye) {
+            let lift = (ground + up * 1.5 - eye).dot(up);
+            if lift > 0.0 { camera.target_ecef += up * lift; camera.update(); }
+        }
     }
 
     pub fn draw_tiles(&self) -> impl Iterator<Item = (&TileGpu, f32)> {
@@ -387,7 +415,7 @@ mod tests {
                     else { Payload::Packed { offset: 8, crc32: 0 } },
             });
         }
-        (Dataset { version: 1, source_root: PathBuf::new(), source_tiles: 4, source_points: 4000, packed_bytes: 8, root: 6, nodes }, camera)
+        (Dataset { version: 1, source_root: PathBuf::new(), source_tiles: 4, source_points: 4000, packed_bytes: 8, root: 6, nodes, terrain: None }, camera)
     }
     fn source_descendants(dataset: &Dataset, id: u32) -> Vec<u32> {
         let n = &dataset.nodes[id as usize];
@@ -436,4 +464,29 @@ mod tests {
         // This probe is completed by the visibility distance bound below.
         assert!(selected.leaves.is_empty());
     }
+    #[test]
+    fn hysteresis_keeps_a_stable_lod_inside_the_dead_band() {
+        let (data, camera) = fixture();
+        let view = View::new(&camera, [1024.0; 2], 1.0);
+        let config = StreamConfig { target_spacing_px: view.score(&data.nodes[6]), ..Default::default() };
+        let coarse = select_view(&data, &view, &config, Some(&HashSet::new()));
+        let refined = select_view(&data, &view, &config, Some(&HashSet::from([6])));
+        assert!(coarse.leaves.contains(&6));
+        assert!(!refined.leaves.contains(&6));
+    }
+
+    #[test]
+    fn actual_fallback_draws_obey_the_point_cap() {
+        let (mut data, camera) = fixture();
+        data.nodes[0].points = 50; data.nodes[1].points = 50;
+        data.nodes[2].points = 1400; data.nodes[3].points = 1000; data.nodes[4].points = 100;
+        let config = StreamConfig { point_budget: 1500, target_spacing_px: 0.01, ..Default::default() };
+        let selection = select(&data, &camera, [1024.0; 2], &config);
+        let resident = HashSet::from([2,3,4,5,6]);
+        let (draws, _) = bounded_resident_cut(&data, &selection, &resident, &camera, [1024.0; 2], &config);
+        assert!(draws.iter().map(|&id| data.nodes[id as usize].points as u64).sum::<u64>() <= 1500);
+        let mut covered: Vec<_> = draws.iter().flat_map(|&id| source_descendants(&data,id)).collect();
+        covered.sort_unstable(); assert_eq!(covered, vec![0,1,3,4]);
+    }
+
 }

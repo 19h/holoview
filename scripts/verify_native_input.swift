@@ -18,14 +18,18 @@ var actions = [[String: Any]]()
 func foreground() {
     app.activate(options: [])
     let ax = AXUIElementCreateApplication(pid)
+    AXUIElementSetAttributeValue(ax, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
     var windows: CFTypeRef?
     if AXUIElementCopyAttributeValue(ax, kAXWindowsAttribute as CFString, &windows) == .success,
        let list = windows as? [AXUIElement], let window = list.first {
         AXUIElementPerformAction(window, kAXRaiseAction as CFString)
     }
 }
-func mouse(_ type: CGEventType, _ point: CGPoint, _ button: CGMouseButton) {
-    CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: button)!.post(tap: .cghidEventTap)
+func mouse(_ type: CGEventType, _ point: CGPoint, _ button: CGMouseButton, _ flags: CGEventFlags = []) {
+    let event = CGEvent(mouseEventSource: CGEventSource(stateID: .hidSystemState), mouseType: type, mouseCursorPosition: point, mouseButton: button)!
+    event.flags = flags
+    event.setIntegerValueField(.mouseEventClickState, value: 1)
+    event.post(tap: .cghidEventTap)
 }
 func key(_ code: CGKeyCode, _ down: Bool) {
     CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down)!.postToPid(pid)
@@ -60,6 +64,18 @@ action("right_drag_orbit") {
         Thread.sleep(forTimeInterval: 0.015)
     }
     mouse(.rightMouseUp, CGPoint(x: x + 48, y: y + 12), .right)
+}
+for (name, flags): (String, CGEventFlags) in [("cmd_drag_orbit", .maskCommand), ("ctrl_drag_orbit", .maskControl)] {
+    action(name) {
+        mouse(.mouseMoved, center, .left, flags)
+        mouse(.leftMouseDown, center, .left, flags)
+        for i in 1...12 {
+            mouse(.leftMouseDragged, CGPoint(x: x + CGFloat(i) * 4, y: y + CGFloat(i)), .left, flags)
+            Thread.sleep(forTimeInterval: 0.015)
+        }
+        mouse(.leftMouseUp, CGPoint(x: x + 48, y: y + 12), .left, flags)
+        mouse(.mouseMoved, center, .left)
+    }
 }
 action("wheel_zoom") {
     CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: 3, wheel2: 0, wheel3: 0)!.post(tap: .cghidEventTap)
