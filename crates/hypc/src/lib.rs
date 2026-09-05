@@ -33,8 +33,9 @@
 //!
 //! RLE format: repeated [u16 run_len][u8 value] (little-endian)
 
+#[cfg(feature = "mmap")]
 use std::fs::File;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, BufWriter, ErrorKind, Write};
 use std::path::Path;
 
 pub const HYPC_MAGIC: [u8; 4] = *b"HYPC";
@@ -158,7 +159,9 @@ fn le_i32(buf: &mut &[u8]) -> io::Result<i32> {
 #[inline(always)]
 fn le_i64(buf: &mut &[u8]) -> io::Result<i64> {
     let b = take(buf, 8)?;
-    Ok(i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    Ok(i64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
 }
 
 #[cold]
@@ -179,10 +182,10 @@ pub fn parse_hypc_bytes(mut p: &[u8]) -> io::Result<HypcTile> {
     }
 
     let flags = le_u32(&mut p)?;
-    let has_key    = (flags & (1 << 0)) != 0;
+    let has_key = (flags & (1 << 0)) != 0;
     let has_labels = (flags & (1 << 1)) != 0;
-    let has_geot   = (flags & (1 << 2)) != 0;
-    let has_smc1   = (flags & (1 << 3)) != 0;
+    let has_geot = (flags & (1 << 2)) != 0;
+    let has_smc1 = (flags & (1 << 3)) != 0;
 
     let count = le_u32(&mut p)? as usize;
     let units_per_meter = le_u32(&mut p)?;
@@ -190,11 +193,7 @@ pub fn parse_hypc_bytes(mut p: &[u8]) -> io::Result<HypcTile> {
         return Err(bad("units_per_meter must be > 0"));
     }
 
-    let anchor_ecef_units = [
-        le_i64(&mut p)?,
-        le_i64(&mut p)?,
-        le_i64(&mut p)?,
-    ];
+    let anchor_ecef_units = [le_i64(&mut p)?, le_i64(&mut p)?, le_i64(&mut p)?];
 
     let tile_key = if has_key {
         let t = take(&mut p, 32)?;
@@ -207,14 +206,16 @@ pub fn parse_hypc_bytes(mut p: &[u8]) -> io::Result<HypcTile> {
 
     // Points (+ optional interleaved label bytes)
     let pts_rec = 12usize + if has_labels { 1 } else { 0 };
-    let pts_bytes = count.checked_mul(pts_rec).ok_or_else(|| bad("points size overflow"))?;
+    let pts_bytes = count
+        .checked_mul(pts_rec)
+        .ok_or_else(|| bad("points size overflow"))?;
     need(p, pts_bytes)?;
 
     let (points_units, labels): (Vec<[i32; 3]>, Option<Vec<u8>>) = if has_labels {
         // Safe, simple decode of interleaved [i32; 3] and u8 records.
         // This replaces a previous `unsafe` implementation that was a source of bugs.
         let mut pts = Vec::<[i32; 3]>::with_capacity(count);
-        let mut ls  = Vec::<u8>::with_capacity(count);
+        let mut ls = Vec::<u8>::with_capacity(count);
 
         for _ in 0..count {
             let dx = le_i32(&mut p)?;
@@ -230,32 +231,16 @@ pub fn parse_hypc_bytes(mut p: &[u8]) -> io::Result<HypcTile> {
         // Fast path: points block is tightly packed 12N bytes; zero‑copy reinterpret + to_vec().
         let raw = take(&mut p, count * 12)?;
 
-        #[cfg(target_endian = "little")]
-        {
-            // Safety:
-            // - alignment: header is 44 or 76 bytes (both %4 == 0), so this slice is 4‑aligned.
-            // - repr: [i32;3] has no padding beyond 12 bytes.
-            // - endianness: little.
-            let as_i32x3: &[[i32; 3]] = bytemuck::try_cast_slice(raw)
-                .map_err(|_| bad("misaligned points block"))?;
-
-            (as_i32x3.to_vec(), None)
+        // A byte slice may start at any address, regardless of header length.
+        let mut pts = Vec::<[i32; 3]>::with_capacity(count);
+        for chunk in raw.chunks_exact(12) {
+            pts.push([
+                i32::from_le_bytes(chunk[0..4].try_into().unwrap()),
+                i32::from_le_bytes(chunk[4..8].try_into().unwrap()),
+                i32::from_le_bytes(chunk[8..12].try_into().unwrap()),
+            ]);
         }
-
-        #[cfg(not(target_endian = "little"))]
-        {
-            // Fallback: portable decode (still a single pass).
-            let mut pts = Vec::<[i32; 3]>::with_capacity(count);
-
-            for chunk in raw.chunks_exact(12) {
-                let dx = i32::from_le_bytes(chunk[0..4].try_into().unwrap());
-                let dy = i32::from_le_bytes(chunk[4..8].try_into().unwrap());
-                let dz = i32::from_le_bytes(chunk[8..12].try_into().unwrap());
-                pts.push([dx, dy, dz]);
-            }
-
-            (pts, None)
-        }
+        (pts, None)
     };
 
     // GEOT
@@ -280,7 +265,7 @@ pub fn parse_hypc_bytes(mut p: &[u8]) -> io::Result<HypcTile> {
             return Err(bad("expected SMC1 tag"));
         }
 
-        let width  = le_u16(&mut p)?;
+        let width = le_u16(&mut p)?;
         let height = le_u16(&mut p)?;
 
         let coord_space = match le_u8(&mut p)? {
@@ -345,6 +330,44 @@ pub fn read_file<P: AsRef<Path>>(path: P) -> io::Result<HypcTile> {
 }
 
 pub fn write_file<P: AsRef<Path>>(path: P, tile: &HypcTile) -> io::Result<()> {
+    if tile.units_per_meter == 0 || tile.points_units.len() > u32::MAX as usize {
+        return Err(bad("invalid units_per_meter or point count"));
+    }
+    if tile
+        .labels
+        .as_ref()
+        .is_some_and(|labels| labels.len() != tile.points_units.len())
+    {
+        return Err(bad("labels length != points length"));
+    }
+    if let Some(smc) = &tile.smc1 {
+        if smc.palette.len() > u16::MAX as usize || smc.data.len() > u32::MAX as usize {
+            return Err(bad("SMC1 size exceeds file representation"));
+        }
+    }
+    let path = path.as_ref();
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = path.with_extension(format!("hypc.{}.{}.tmp", std::process::id(), id));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let result = (|| {
+        let mut writer = BufWriter::new(file);
+        write_tile(&mut writer, tile)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn write_tile<W: Write>(mut file: W, tile: &HypcTile) -> io::Result<()> {
     let mut flags = 0u32;
 
     if tile.tile_key.is_some() {
@@ -362,8 +385,6 @@ pub fn write_file<P: AsRef<Path>>(path: P, tile: &HypcTile) -> io::Result<()> {
     if tile.smc1.is_some() {
         flags |= 1 << 3;
     }
-
-    let mut file = File::create(path)?;
 
     file.write_all(&HYPC_MAGIC)?;
 
@@ -580,4 +601,53 @@ fn write_i32<W: Write>(w: &mut W, v: i32) -> io::Result<()> {
 #[inline]
 fn write_i64<W: Write>(w: &mut W, v: i64) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_preserves_global_lattice_and_unaligned_input() {
+        for labels in [None, Some(vec![3, 255])] {
+            let tile = HypcTile {
+                units_per_meter: 2000,
+                anchor_ecef_units: [7_568_000_001, -1_800_000_013, 10_070_000_005],
+                tile_key: Some([7; 32]),
+                points_units: vec![[i32::MIN, 0, i32::MAX], [111, -222, 333]],
+                labels,
+                geot: Some(GeoExtentQ7::from_deg(13.0, 14.0, 52.0, 53.0)),
+                smc1: None,
+            };
+            let mut encoded = vec![0u8];
+            write_tile(&mut encoded, &tile).unwrap();
+            let decoded = parse_hypc_bytes(&encoded[1..]).unwrap();
+            assert_eq!(decoded.anchor_ecef_units, tile.anchor_ecef_units);
+            assert_eq!(decoded.points_units, tile.points_units);
+            assert_eq!(decoded.labels, tile.labels);
+            assert_eq!(decoded.units_per_meter, tile.units_per_meter);
+            for count in 0..encoded.len() - 1 {
+                assert!(parse_hypc_bytes(&encoded[1..=count]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn failed_write_preserves_existing_file() {
+        let path =
+            std::env::temp_dir().join(format!("hypc-write-test-{}.hypc", std::process::id()));
+        std::fs::write(&path, b"existing").unwrap();
+        let tile = HypcTile {
+            units_per_meter: 0,
+            anchor_ecef_units: [0; 3],
+            tile_key: None,
+            points_units: vec![],
+            labels: None,
+            geot: None,
+            smc1: None,
+        };
+        assert!(write_file(&path, &tile).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing");
+        std::fs::remove_file(path).unwrap();
+    }
 }

@@ -3,16 +3,6 @@ use glam::{DMat3, DVec3, Mat3, Mat4, Vec3};
 use hypc::{ecef_to_geodetic, geodetic_to_ecef, split_f64_to_f32_pair};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 
-/// This matrix converts clip-space coordinates from OpenGL conventions (Y-up, Z in [-1, 1])
-/// to WebGPU conventions (Y-down, Z in [0, 1]).
-#[rustfmt::skip]
-pub const OPENGL_TO_WGPU_MATRIX: Mat4 = Mat4::from_cols_array(&[
-    -1.0,  0.0, 0.0, 0.0,
-    0.0, -1.0, 0.0, 0.0,
-    0.0,  0.0, 0.5, 0.0,
-    0.0,  0.0, 0.5, 1.0,
-]);
-
 #[derive(Debug, Clone)]
 pub struct Camera {
     // --- Orbital Parameters (Primary State) ---
@@ -90,8 +80,11 @@ impl Camera {
         self.position_ecef = self.target_ecef + enu_to_ecef * offset_enu;
 
         // 5. Update the derived geodetic coordinates for external use (e.g., UI).
-        let (lat, lon, h) =
-            ecef_to_geodetic(self.position_ecef.x, self.position_ecef.y, self.position_ecef.z);
+        let (lat, lon, h) = ecef_to_geodetic(
+            self.position_ecef.x,
+            self.position_ecef.y,
+            self.position_ecef.z,
+        );
         self.lat_deg = lat;
         self.lon_deg = lon;
         self.h_m = h;
@@ -135,7 +128,7 @@ impl Camera {
 
     /// Returns combined view‑projection matrix in ECEF meters.
     pub fn view_proj_ecef(&self) -> Mat4 {
-        OPENGL_TO_WGPU_MATRIX * self.proj * self.view_ecef()
+        self.proj * self.view_ecef()
     }
 
     /// Returns a rotation-only view matrix that transforms from ECEF to the camera's
@@ -153,17 +146,17 @@ impl Camera {
         let world_up = Vec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);
 
         // The "side" vector is orthogonal to forward and world_up.
-        // f.cross(world_up) gives the "left" vector.
+        // f.cross(world_up) gives the right vector.
         let s = f.cross(world_up).normalize();
 
         // The camera's local "up" vector is orthogonal to the side and forward vectors.
-        // s.cross(f) gives the "down" vector.
+        // s.cross(f) gives the camera up vector.
         let u = s.cross(f);
 
         // The view matrix is the inverse of the camera's basis matrix. For an orthonormal
         // matrix, the inverse is the transpose. The basis columns are [right, up, back].
-        // We must use the opposites of s (left) and u (down) to get right and up.
-        let rot_mat = Mat3::from_cols(-s, -u, -f).transpose();
+        // Projection already uses WebGPU depth [0, 1]; no OpenGL remapping.
+        let rot_mat = Mat3::from_cols(s, u, -f).transpose();
         Mat4::from_mat3(rot_mat)
     }
 
@@ -276,5 +269,28 @@ impl CameraController {
             }
         }
         self.last_mouse = Some(xy);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projection_uses_webgpu_depth_without_a_second_remap() {
+        let camera = Camera::new(
+            52.513,
+            13.375,
+            800.0,
+            Mat4::perspective_rh(60f32.to_radians(), 1.0, 10.0, 10000.0),
+        );
+        let forward = (camera.target_ecef - camera.position_ecef)
+            .normalize()
+            .as_vec3();
+        for (distance, expected) in [(10.0, 0.0), (10000.0, 1.0)] {
+            let clip = camera.view_proj_ecef() * (forward * distance).extend(1.0);
+            assert!((clip.z / clip.w - expected).abs() < 2e-6);
+            assert!((clip.w - distance).abs() < distance * 2e-6);
+        }
     }
 }

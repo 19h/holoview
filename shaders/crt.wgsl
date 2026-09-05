@@ -68,18 +68,14 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let vignette      = 1.0 - UBO.vignette * smoothstep(0.6, 1.0, vignette_dist);
 
     // --------------------------------------------------------------------
-    // Background mask (treat as background when depth ≈ 1 and alpha ≥ 0.5)
+    // Background mask uses the geometry tag independently of eye depth.
     // --------------------------------------------------------------------
     let uv_d = uv_c; // same orientation as color
     // Normalized sampling with NonFiltering sampler
     let depth_sample = textureSampleLevel(tDepthLin, samp, uv_d, 0.0);
-    let depth_z      = depth_sample.r;
-    let depth_alpha  = depth_sample.a; // 1 = real background, 0 = overlay (grid)
+    let depth_alpha  = depth_sample.a; // 1 = point geometry, 0 = background/grid
 
-    // Background if z≈1 OR the pixel is grid/overlay (tag<0.5)
-    let is_far  = step(0.9999, depth_z);
-    let is_grid = 1.0 - step(0.5, depth_alpha);
-    let bg_mask = max(is_far, is_grid);
+    let bg_mask = 1.0 - step(0.5, depth_alpha);
 
     // Combine colours
     let bg_color = (bg_base * 0.85 + grain) * scan_bg;

@@ -25,3 +25,4 @@ serde_json = "1.0"
 
 # Our new, local, dependency-free format library
 hypc = { path = "../hypc" }
+proj = { version = "0.31", default-features = false }

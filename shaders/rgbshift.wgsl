@@ -42,7 +42,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let dl   = textureSampleLevel(tDepthLin, samp, uv_d, 0.0);
 
     // Skip grid (tag<0.5) and true background (z≈1).
-    if (dl.a < 0.5 || dl.r >= 0.9999) {
+    if (dl.a < 0.5) {
         return textureSampleLevel(tSrc, samp, uv_c, 0.0);
     }
 

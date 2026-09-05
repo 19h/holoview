@@ -1,9 +1,9 @@
 // Semantic color grading post pass.
 // Expects:
 //   tSrc.rgb  = base color
-//   tDepthLin = (r = linearized depth proxy [0..1], g = semantic label / 255, a = tag)
+//   tDepthLin = (r = linear eye depth in metres, g = semantic label / 255, a = tag)
 //
-// For background pixels (z >= ~1), output original color.
+// For background pixels (tag < 0.5), output original color.
 // Otherwise mix towards a class color by `amount`.
 
 struct Uniforms {
@@ -60,9 +60,9 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
     let c  = textureSampleLevel(tSrc,      samp, uv_c, 0.0);
     let dl = textureSampleLevel(tDepthLin, samp, uv_d, 0.0);
 
-    // Background: z ≈ 1 retains the original color.
+    // The geometry tag distinguishes background at every viewing distance.
     let z = dl.r;
-    if (z >= 0.9999) {
+    if (dl.a < 0.5) {
         // Preserve incoming coverage alpha for later passes if needed.
         return vec4<f32>(c.rgb, c.a);
     }

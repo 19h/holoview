@@ -32,7 +32,8 @@ impl Targets {
         // Define texture formats.
         let color_fmt = wgpu::TextureFormat::Rgba16Float;
         let depth_fmt = wgpu::TextureFormat::Depth32Float;
-        let dlin_fmt = wgpu::TextureFormat::Rgba16Float;
+        // Linear eye depth in metres needs f32 precision for sub-metre surfaces.
+        let dlin_fmt = wgpu::TextureFormat::Rgba32Float;
 
         // Helper to create a texture with the given parameters.
         let create_tex = |label: &str, format, usage| {

@@ -26,55 +26,55 @@ fn meridian_convergence_rad(lat_deg: f64, lon_deg: f64) -> f64 {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GridUniforms {
     /// Transform from model space to clip space.
-    pub model_view_proj: Mat4,     // 64 B
+    pub model_view_proj: Mat4, // 64 B
     /// Camera height above the tangent plane, meters.
-    pub camera_height_m: f32,      // +4
-    pub _pad0: [f32; 3],           // +12 -> 80
+    pub camera_height_m: f32, // +4
+    pub _pad0: [f32; 3], // +12 -> 80
     /// EN offset (meters) relative to world anchor; vec2 takes a 16‑B slot in uniforms.
-    pub enu_offset_m: [f32; 2],    // +8
-    pub _pad1: [f32; 2],           // +8  -> 96  (pad vec2 to 16)
+    pub enu_offset_m: [f32; 2], // +8
+    pub _pad1: [f32; 2], // +8  -> 96  (pad vec2 to 16)
     /// Half‑extent (meters) from center to edge.
-    pub plane_extent_m: f32,       // +4
-    pub _pad2: [f32; 3],           // +12 -> 112 (struct size rounded to 16)
+    pub plane_extent_m: f32, // +4
+    pub _pad2: [f32; 3], // +12 -> 112 (struct size rounded to 16)
 }
 
 // Compile‑time safety check: buffer size must match WGSL‑reflected size.
 const _: [(); 112] = [(); core::mem::size_of::<GridUniforms>()];
 
 pub struct GroundGridPipeline {
-    pipeline:       wgpu::RenderPipeline,
-    bind_group:     wgpu::BindGroup,
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
-    quad_vb:        wgpu::Buffer,
-    origin_ecef_m:  [f64; 3],   // dataset/world anchor
-    plane_extent_m: f32,        // meters from center to edge
+    quad_vb: wgpu::Buffer,
+    origin_ecef_m: [f64; 3], // dataset/world anchor
+    plane_extent_m: f32,     // meters from center to edge
 }
 
 impl GroundGridPipeline {
     pub fn new(
-        device:     &wgpu::Device,
-        color_fmt:  wgpu::TextureFormat,
-        dlin_fmt:   wgpu::TextureFormat,
-        depth_fmt:  wgpu::TextureFormat,
+        device: &wgpu::Device,
+        color_fmt: wgpu::TextureFormat,
+        dlin_fmt: wgpu::TextureFormat,
+        depth_fmt: wgpu::TextureFormat,
     ) -> Self {
         // Uniform buffer
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label:               Some("Grid Uniform Buffer"),
-            size:                std::mem::size_of::<GridUniforms>() as u64,
-            usage:               wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            label: Some("Grid Uniform Buffer"),
+            size: std::mem::size_of::<GridUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         // Bind group layout
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label:   Some("Grid BGL"),
+            label: Some("Grid BGL"),
             entries: &[wgpu::BindGroupLayoutEntry {
-                binding:    0,
+                binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
-                    ty:                 wgpu::BufferBindingType::Uniform,
+                    ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size:   None,
+                    min_binding_size: None,
                 },
                 count: None,
             }],
@@ -82,83 +82,87 @@ impl GroundGridPipeline {
 
         // Bind group
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label:   Some("Grid Bind Group"),
-            layout:  &bind_group_layout,
+            label: Some("Grid Bind Group"),
+            layout: &bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
-                binding:  0,
+                binding: 0,
                 resource: uniform_buffer.as_entire_binding(),
             }],
         });
 
         // Full‑screen quad (two triangles)
         let corners: [[f32; 2]; 6] = [
-            [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0],
-            [-1.0, -1.0], [1.0, 1.0],  [-1.0, 1.0],
+            [-1.0, -1.0],
+            [1.0, -1.0],
+            [1.0, 1.0],
+            [-1.0, -1.0],
+            [1.0, 1.0],
+            [-1.0, 1.0],
         ];
         let quad_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label:    Some("Grid Quad VB"),
+            label: Some("Grid Quad VB"),
             contents: bytemuck::cast_slice(&corners),
-            usage:    wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX,
         });
 
         // Shader module
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label:  Some("Grid WGSL"),
+            label: Some("Grid WGSL"),
             source: wgpu::ShaderSource::Wgsl(GRID_WGSL.into()),
         });
 
         // Pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label:               Some("Grid Pipeline Layout"),
-            bind_group_layouts:  &[&bind_group_layout],
+            label: Some("Grid Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
         // Render pipeline
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label:   Some("Ground Grid Pipeline"),
-            layout:  Some(&pipeline_layout),
+            label: Some("Ground Grid Pipeline"),
+            layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module:            &shader,
-                entry_point:       "vs_main",
+                module: &shader,
+                entry_point: "vs_main",
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<[f32; 2]>() as u64,
-                    step_mode:    wgpu::VertexStepMode::Vertex,
-                    attributes:   &[wgpu::VertexAttribute {
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
                         shader_location: 0,
-                        format:          wgpu::VertexFormat::Float32x2,
-                        offset:          0,
+                        format: wgpu::VertexFormat::Float32x2,
+                        offset: 0,
                     }],
                 }],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module:            &shader,
-                entry_point:       "fs_main",
+                module: &shader,
+                entry_point: "fs_main",
                 targets: &[
                     Some(wgpu::ColorTargetState {
-                        format:     color_fmt,
-                        blend:      Some(wgpu::BlendState::ALPHA_BLENDING),
+                        format: color_fmt,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     Some(wgpu::ColorTargetState {
-                        format:     dlin_fmt,
-                        blend:      None, // Direct tag write
+                        format: dlin_fmt,
+                        blend: None, // Direct tag write
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                 ],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
-            primitive:   wgpu::PrimitiveState::default(),
+            primitive: wgpu::PrimitiveState::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
-                format:                 depth_fmt,
-                depth_write_enabled:    false, // Do not occlude points
-                depth_compare:          wgpu::CompareFunction::LessEqual,
-                stencil:                wgpu::StencilState::default(),
-                bias:                   wgpu::DepthBiasState::default(),
+                format: depth_fmt,
+                depth_write_enabled: false, // Do not occlude points
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview:   None,
+            multiview: None,
         });
 
         Self {
@@ -178,8 +182,8 @@ impl GroundGridPipeline {
 
     pub fn draw<'a>(
         &'a self,
-        rpass:  &mut wgpu::RenderPass<'a>,
-        queue:  &wgpu::Queue,
+        rpass: &mut wgpu::RenderPass<'a>,
+        queue: &wgpu::Queue,
         camera: &Camera,
         grid_utm_align: bool,
     ) {
@@ -223,11 +227,11 @@ impl GroundGridPipeline {
         let uniforms = GridUniforms {
             model_view_proj: view_proj * model,
             camera_height_m: camera.h_m as f32,
-            _pad0:          [0.0; 3],
+            _pad0: [0.0; 3],
             enu_offset_m,
-            _pad1:          [0.0; 2],
+            _pad1: [0.0; 2],
             plane_extent_m: self.plane_extent_m,
-            _pad2:          [0.0; 3],
+            _pad2: [0.0; 3],
         };
 
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -316,7 +320,7 @@ fn fs_main(in: VSOut) -> FSOut {
     var out: FSOut;
     out.color = vec4<f32>(color, opacity * 0.10); // was 0.18
     // Overlay tag (alpha=0) and background depth (r=1)
-    out.dlin = vec4<f32>(1.0, 0.0, 0.0, 0.0);
+    out.dlin = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     return out;
 }
 "#;

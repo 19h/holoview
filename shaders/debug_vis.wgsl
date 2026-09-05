@@ -48,12 +48,12 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 
     if (U.mode == 1u) {
         // Depth: near = white
-        let z = 1.0 - clamp(dl.r, 0.0, 1.0);
+        let z = select(0.0, 1.0 / (1.0 + dl.r / 1000.0), dl.a >= 0.5);
         return vec4<f32>(z, z, z, 1.0);
     } else if (U.mode == 2u) {
         // Labels (class colors), background dimmed
         let z = dl.r;
-        if (z >= 0.9999) {
+        if (dl.a < 0.5) {
             return vec4<f32>(0.05, 0.05, 0.05, 1.0);
         }
         let lbl = u32(round(clamp(dl.g, 0.0, 1.0) * 255.0));

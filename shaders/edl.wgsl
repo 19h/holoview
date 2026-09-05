@@ -1,6 +1,6 @@
 // Eye-dome lighting (EDL) post-processing shader
 // Enhances depth perception by darkening occluded areas.
-// NOTE: preserves incoming alpha so SMC1 labels (in RT0.a) survive the next pass.
+// RT1.r is positive linear eye depth in metres; RT1.a tags geometry.
 
 struct Uniforms {
     inv_size  : vec2<f32>,
@@ -30,14 +30,14 @@ fn vs_main(@location(0) pos : vec2<f32>) -> VSOut {
     return out;
 }
 
-// Helper: accumulate only from valid neighbor (tag>=0.5 AND z<1)
+// Helper: accumulate only from valid neighbor (tag>=0.5 AND z>0)
 fn acc(uv_n: vec2<f32>, lz0: f32) -> f32 {
     let dl = textureSampleLevel(tDepthLin, samp, uv_n, 0.0);
     let z  = dl.r;
     let a  = dl.a;
     // mask: 1 for real geometry neighbor, else 0
-    let m  = select(0.0, 1.0, a >= 0.5 && z < 0.9999);
-    return m * max(0.0, log(z + 1e-6) - lz0);
+    let m  = select(0.0, 1.0, a >= 0.5 && z > 0.0);
+    return m * max(0.0, lz0 - log(max(z, 1e-6)));
 }
 
 @fragment
@@ -54,8 +54,8 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     let z0  = dl0.r;
     let a0  = dl0.a;
 
-    // Skip non-geometry (grid/tag==0) and true background (z≈1)
-    if (a0 < 0.5 || z0 >= 0.9999) {
+    // Skip pixels without geometry using the tag, never a depth threshold.
+    if (a0 < 0.5 || z0 <= 0.0) {
         return src;
     }
 
@@ -82,6 +82,6 @@ fn fs_main(in : VSOut) -> @location(0) vec4<f32> {
     s += acc(uv_d + offsets[6] * px * r, lz0);
     s += acc(uv_d + offsets[7] * px * r, lz0);
 
-    let shade = exp(-UBO.strength * s);
+    let shade = exp(-UBO.strength * 300.0 * s / 8.0);
     return vec4<f32>(col * shade, src.a); // preserve point coverage alpha
 }

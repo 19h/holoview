@@ -1,63 +1,15 @@
 use crate::camera::Camera;
 use crate::data::types::{PointInstance, TileGpu};
 use anyhow::Result;
-use hypc::{
-    ecef_to_geodetic, read_file, smc1_decode_rle, wgs84, HypcTile, Smc1CoordSpace, Smc1Encoding,
-};
+use hypc::{ecef_to_geodetic, read_file, smc1_decode_rle, HypcTile, Smc1CoordSpace, Smc1Encoding};
 use rayon::prelude::*;
 use std::path::Path;
-
-// ASSUMPTION: The `PointInstance` struct is defined in `crate::data::types`.
-// For this file to be self-contained and compilable, we define the module and the
-// struct here.
-pub mod data {
-    pub mod types {
-        #[repr(C)]
-        #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-        pub struct PointInstance {
-            pub ofs_m: [f32; 3],
-            pub label: u32,
-        }
-
-        // Unchanged struct, provided for context.
-        pub struct TileGpu {
-            pub key: u64,
-            pub units_per_meter: f32,
-            pub anchor_units: [i64; 3],
-            pub instances_len: u32,
-            pub vtx: wgpu::Buffer,
-            pub ubo: wgpu::Buffer,
-            pub bind: wgpu::BindGroup,
-        }
-    }
-}
 
 // wgpu::util::DeviceExt is a trait, so we need to bring it into scope.
 mod wgpu_util {
     pub use wgpu::util::DeviceExt;
 }
 use wgpu_util::*;
-
-#[inline(always)]
-fn build_ecef_to_enu(lat_rad: f64, lon_rad: f64) -> [[f64; 3]; 3] {
-    let (sφ, cφ) = lat_rad.sin_cos();
-    let (sλ, cλ) = lon_rad.sin_cos();
-    // Rows are ê^T, n̂^T, û^T in ECEF components.
-    [
-        [-sλ, cλ, 0.0],
-        [-sφ * cλ, -sφ * sλ, cφ],
-        [cφ * cλ, cφ * sλ, sφ],
-    ]
-}
-
-#[inline(always)]
-fn mul_mat3_vec3(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
-    [
-        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
-    ]
-}
 
 /// Read one HYPC tile from disk and upload to GPU (instances + per-tile UBO).
 pub fn load_hypc_tile(
@@ -68,8 +20,6 @@ pub fn load_hypc_tile(
     viewport_size: [f32; 2], // Initial viewport size
 ) -> Result<TileGpu> {
     let tile: HypcTile = read_file(path)?;
-    let upm_f32 = tile.units_per_meter as f32;
-    let inv_upm_f32 = upm_f32.recip();
     let inv_upm_f64 = (tile.units_per_meter as f64).recip();
 
     // SMC1 decode (only if needed)
@@ -80,6 +30,12 @@ pub fn load_hypc_tile(
                     Smc1Encoding::Raw => smc1.data.clone(),
                     Smc1Encoding::Rle => smc1_decode_rle(&smc1.data)?,
                 };
+                anyhow::ensure!(
+                    smc1.width > 0
+                        && smc1.height > 0
+                        && data.len() == smc1.width as usize * smc1.height as usize,
+                    "Invalid SMC1 dimensions/payload length"
+                );
                 (smc1.width as u32, smc1.height as u32, Some(data))
             } else {
                 (0, 0, None)
@@ -99,7 +55,7 @@ pub fn load_hypc_tile(
         tile.anchor_ecef_units[2] as f64 / upm64,
     ];
 
-    // Fast path: either direct labels, or SMC path with linearized geodesy
+    // Direct labels take precedence over geographic mask sampling.
     let has_direct_labels = tile
         .labels
         .as_ref()
@@ -115,9 +71,9 @@ pub fn load_hypc_tile(
                 .enumerate()
                 .map(|(i, p)| {
                     let ofs_m = [
-                        (p[0] as f32) * inv_upm_f32,
-                        (p[1] as f32) * inv_upm_f32,
-                        (p[2] as f32) * inv_upm_f32,
+                        (p[0] as f64 * inv_upm_f64) as f32,
+                        (p[1] as f64 * inv_upm_f64) as f32,
+                        (p[2] as f64 * inv_upm_f64) as f32,
                     ];
                     let label = labels.map(|ls| ls[i]).unwrap_or(0) as u32;
                     PointInstance { ofs_m, label }
@@ -125,12 +81,15 @@ pub fn load_hypc_tile(
                 .collect()
         } else {
             let (lon_min, lon_max, lat_min, lat_max) = geot_deg.unwrap();
-            let inv_dlon = 1.0 / (lon_max - lon_min + 1e-12);
-            let inv_dlat = 1.0 / (lat_max - lat_min + 1e-12);
+            anyhow::ensure!(
+                lon_max > lon_min && lat_max > lat_min,
+                "Geographic mask requires a non-degenerate GEOT extent"
+            );
+            let inv_dlon = 1.0 / (lon_max - lon_min);
+            let inv_dlat = 1.0 / (lat_max - lat_min);
 
             let smc = smc_raw.as_ref().unwrap();
             let sw = smc_w as usize;
-            let sh = smc_h as usize;
 
             tile.points_units
                 .par_iter()
@@ -158,9 +117,9 @@ pub fn load_hypc_tile(
                     // 5. Create the PointInstance. The offset is still the original ECEF offset for rendering.
                     PointInstance {
                         ofs_m: [
-                            (p[0] as f32) * inv_upm_f32,
-                            (p[1] as f32) * inv_upm_f32,
-                            (p[2] as f32) * inv_upm_f32,
+                            (p[0] as f64 * inv_upm_f64) as f32,
+                            (p[1] as f64 * inv_upm_f64) as f32,
+                            (p[2] as f64 * inv_upm_f64) as f32,
                         ],
                         label,
                     }
@@ -171,88 +130,34 @@ pub fn load_hypc_tile(
     // Tile-level analysis and logging is confined to debug builds.
     #[cfg(debug_assertions)]
     {
-        // --- Start: Tile-level orientation calculation via PCA ---
-
-        // 1. Get geodetic coordinates of the anchor to define the local tangent plane.
-        let (anchor_lat_deg, anchor_lon_deg, _) =
-            ecef_to_geodetic(anchor_m[0], anchor_m[1], anchor_m[2]);
-        let anchor_lat_rad = anchor_lat_deg.to_radians();
-        let anchor_lon_rad = anchor_lon_deg.to_radians();
-
-        // 2. Build the transformation matrix from ECEF to the local ENU frame.
-        let ecef_to_enu_mat = build_ecef_to_enu(anchor_lat_rad, anchor_lon_rad);
-
-        // 3. Calculate PCA-based orientation. This requires iterating through points to build covariance matrix.
-        let num_points = instances.len() as f64;
-        let mut mean_e = 0.0;
-        let mut mean_n = 0.0;
-        let mut enu_coords = Vec::with_capacity(instances.len());
-
-        for inst in &instances {
-            let ofs_m_f64 = [inst.ofs_m[0] as f64, inst.ofs_m[1] as f64, inst.ofs_m[2] as f64];
-            let ofs_enu = mul_mat3_vec3(&ecef_to_enu_mat, ofs_m_f64);
-            let (e, n) = (ofs_enu[0], ofs_enu[1]);
-            enu_coords.push((e, n));
-            mean_e += e;
-            mean_n += n;
-        }
-        mean_e /= num_points;
-        mean_n /= num_points;
-
-        let mut cov_ee = 0.0;
-        let mut cov_nn = 0.0;
-        let mut cov_en = 0.0;
-
-        for (e, n) in enu_coords {
-            let de = e - mean_e;
-            let dn = n - mean_n;
-            cov_ee += de * de;
-            cov_nn += dn * dn;
-            cov_en += de * dn;
-        }
-        cov_ee /= num_points;
-        cov_nn /= num_points;
-        cov_en /= num_points;
-
-        // 4. Calculate angle of the primary eigenvector.
-        // angle = 0.5 * atan2(2 * cov_xy, cov_xx - cov_yy)
-        let pca_angle_rad = 0.5 * cov_en.mul_add(2.0, 0.0).atan2(cov_ee - cov_nn);
-        let pca_angle_deg = pca_angle_rad.to_degrees();
-
-        // --- End: Tile-level orientation calculation via PCA ---
-
         // AABB calculation for logging purposes.
         use std::f32::{INFINITY, NEG_INFINITY};
-        let (min, max) = instances
-            .par_iter()
-            .map(|pi| (pi.ofs_m, pi.ofs_m))
-            .reduce(
-                || ([INFINITY; 3], [NEG_INFINITY; 3]),
-                |(a_min, a_max), (b_min, b_max)| {
-                    (
-                        [
-                            a_min[0].min(b_min[0]),
-                            a_min[1].min(b_min[1]),
-                            a_min[2].min(b_min[2]),
-                        ],
-                        [
-                            a_max[0].max(b_max[0]),
-                            a_max[1].max(b_max[1]),
-                            a_max[2].max(b_max[2]),
-                        ],
-                    )
-                },
-            );
+        let (min, max) = instances.par_iter().map(|pi| (pi.ofs_m, pi.ofs_m)).reduce(
+            || ([INFINITY; 3], [NEG_INFINITY; 3]),
+            |(a_min, a_max), (b_min, b_max)| {
+                (
+                    [
+                        a_min[0].min(b_min[0]),
+                        a_min[1].min(b_min[1]),
+                        a_min[2].min(b_min[2]),
+                    ],
+                    [
+                        a_max[0].max(b_max[0]),
+                        a_max[1].max(b_max[1]),
+                        a_max[2].max(b_max[2]),
+                    ],
+                )
+            },
+        );
 
         log::debug!(
-            "HYPC {:?}: pts={}, upm={}, anchor_ecef_m=({:.3},{:.3},{:.3}), ofs_AABB_m=min({:.2},{:.2},{:.2}) max({:.2},{:.2},{:.2}), pca_orientation_deg_from_N={:.1}",
+            "HYPC {:?}: pts={}, upm={}, anchor_ecef_m=({:.3},{:.3},{:.3}), ofs_AABB_m=min({:.2},{:.2},{:.2}) max({:.2},{:.2},{:.2})",
             path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
             tile.points_units.len(),
             tile.units_per_meter,
             anchor_m[0], anchor_m[1], anchor_m[2],
             min[0], min[1], min[2],
-            max[0], max[1], max[2],
-            pca_angle_deg
+            max[0], max[1], max[2]
         );
     }
 

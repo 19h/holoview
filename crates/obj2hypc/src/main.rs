@@ -1,11 +1,14 @@
 use anyhow::{Context, Result};
+mod coordinates;
+mod semantics;
+mod surface;
 use clap::{Parser, ValueEnum};
 use log::{info, warn};
 use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
-    io::{BufRead, BufReader, Read},
+    io::BufReader,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -15,7 +18,6 @@ use walkdir::WalkDir;
 // OSM / geometry utilities
 use osmpbf::{Element, ElementReader, Way};
 use rstar::{RTree, RTreeObject, AABB};
-use smallvec::SmallVec;
 
 // HYPC writer + math
 use hypc::{
@@ -26,13 +28,15 @@ use hypc::{
 /// How to interpret incoming OBJ vertex triples.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum InputCs {
-    /// Try to decide automatically from ranges.
+    /// Use --source-crs; otherwise require an explicit coordinate system.
     Auto,
     /// OBJ is `[lon, lat, h_m]`.
     Geodetic,
     /// OBJ is ECEF meters `[X, Y, Z]`.
     Ecef,
-    /// OBJ is local meters `[x, y, z]` in an arbitrary local frame.
+    /// OBJ is projected easting/northing in --source-crs, with height in metres.
+    Projected,
+    /// Unsupported arbitrary local frame; requires explicit georeferencing.
     LocalM,
 }
 
@@ -43,10 +47,19 @@ impl std::fmt::Display for InputCs {
             InputCs::Geodetic => "geodetic",
             InputCs::Ecef => "ecef",
             InputCs::LocalM => "local_m",
+            InputCs::Projected => "projected",
         };
 
         f.write_str(s)
     }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Sampling {
+    /// Sample triangle interiors on a shared metric lattice; avoids tile-edge vertex-density artifacts.
+    Surface,
+    /// Preserve raw OBJ vertices (for point-only input or forensic comparison).
+    Vertices,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -62,9 +75,25 @@ struct Args {
     #[arg(long, default_value_t = 1000)]
     units_per_meter: u32,
 
-    /// Either auto-detect or force the input coordinate system of OBJ vertices.
+    /// Explicit input coordinate system; auto requires --source-crs.
     #[arg(long, value_enum, default_value_t = InputCs::Auto)]
     input_cs: InputCs,
+
+    #[arg(long, value_enum, default_value_t = Sampling::Surface)]
+    sampling: Sampling,
+
+    /// Global surface lattice spacing in metres (independent of tile extents).
+    #[arg(long, default_value_t = 0.5)]
+    surface_spacing_m: f64,
+
+    /// Shared horizontal CRS for projected OBJ coordinates (e.g. EPSG:25833).
+    #[arg(long)]
+    source_crs: Option<String>,
+
+    /// Explicit dataset-wide correction: ellipsoidal height = OBJ z + this value (m).
+    /// Zero preserves source heights; no vertical datum transformation is inferred.
+    #[arg(long, default_value_t = 0.0)]
+    height_offset_m: f64,
 
     #[arg(long, default_value_t = false)]
     overwrite: bool,
@@ -98,7 +127,7 @@ struct Args {
     #[arg(long, default_value_t = true)]
     smc1_compress: bool,
 
-    /// Expand each tile bbox by this margin when retaining nodes (meters).
+    /// Expand each tile bbox when selecting intersecting complete OSM geometry (metres).
     #[arg(long, default_value_t = 50.0)]
     osm_margin_m: f64,
 
@@ -261,10 +290,7 @@ fn build_local_index(input_dir: &str) -> LocalIndex {
             .exact
             .entry(stem.clone())
             .and_modify(|existing| {
-                let existing_ext = existing
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
+                let existing_ext = existing.extension().and_then(|s| s.to_str()).unwrap_or("");
                 // Replace a stored `.obj` with a `.zip` if we encounter one.
                 if existing_ext.eq_ignore_ascii_case("obj") && ext == "zip" {
                     *existing = path.clone();
@@ -277,13 +303,13 @@ fn build_local_index(input_dir: &str) -> LocalIndex {
 }
 
 fn resolve_by_prefix(idx: &LocalIndex, prefix: &str, prefer_zip: bool) -> Option<PathBuf> {
-    // 1️⃣  Exact match – the fast path.
+    // 1. Exact match – the fast path.
     if let Some(path) = idx.exact.get(prefix) {
         return Some(path.clone());
     }
 
-    // 2️⃣  Prefix‑based lookup.  `BTreeMap::range` gives us all keys that are
-    //     lexicographically ≥ the given start string.
+    // 2. Prefix‑based lookup.  `BTreeMap::range` gives us all keys that are
+    //    lexicographically ≥ the given start string.
     let start = prefix.to_string();
     for (name, paths) in idx.names.range(start..) {
         // Once we encounter a key that does not start with the prefix we can stop.
@@ -329,46 +355,9 @@ fn tilekey_from_prefix(prefix: &str) -> [u8; 32] {
 }
 
 /// Read the raw vertex triples from an OBJ file (or any `Read` source).
-fn parse_obj_vertices<R: Read>(reader: R) -> Result<Vec<[f64; 3]>> {
-    let mut vertices = Vec::new();
-
-    for line_result in BufReader::new(reader).lines() {
-        let line = line_result?;
-        let trimmed = line.trim();
-
-        // OBJ vertex records begin with "v ".
-        if !trimmed.starts_with("v ") {
-            continue;
-        }
-
-        // Split the line into its whitespace‑separated components.
-        let mut parts = trimmed.split_whitespace();
-
-        parts.next(); // Skip the leading "v"
-
-        // Parse the three coordinate values, providing a clear error if missing.
-        let x: f64 = parts
-            .next()
-            .context("Missing x coordinate")?
-            .parse()?;
-
-        let y: f64 = parts
-            .next()
-            .context("Missing y coordinate")?
-            .parse()?;
-
-        let z: f64 = parts
-            .next()
-            .context("Missing z coordinate")?
-            .parse()?;
-
-        // Store only finite triples.
-        if x.is_finite() && y.is_finite() && z.is_finite() {
-            vertices.push([x, y, z]);
-        }
-    }
-
-    Ok(vertices)
+#[cfg(test)]
+fn parse_obj_vertices<R: std::io::Read>(reader: R) -> Result<Vec<[f64; 3]>> {
+    Ok(surface::read_obj(reader, false)?.vertices)
 }
 
 // ==============================
@@ -430,7 +419,6 @@ type OverlayMap = HashMap<String, SemOverlayPerTile>;
 struct NodeRec {
     lon: f64,
     lat: f64,
-    tiles: SmallVec<[u32; 4]>,
 }
 
 /// Helper that periodically logs progress.
@@ -485,11 +473,13 @@ fn pad_degrees_for(latitude_deg: f64, pad_meters: f64) -> (f64, f64) {
     const METERS_PER_DEG_LON_EQUATOR: f64 = 111_320.0;
 
     // Scale longitude based on latitude.
-    let meters_per_deg_lon = METERS_PER_DEG_LON_EQUATOR
-        * latitude_deg.to_radians().cos().abs()
-        .max(1e-6);
+    let meters_per_deg_lon =
+        METERS_PER_DEG_LON_EQUATOR * latitude_deg.to_radians().cos().abs().max(1e-6);
 
-    (pad_meters / METERS_PER_DEG_LAT, pad_meters / meters_per_deg_lon)
+    (
+        pad_meters / METERS_PER_DEG_LAT,
+        pad_meters / meters_per_deg_lon,
+    )
 }
 
 #[inline]
@@ -555,7 +545,10 @@ fn classify_way(w: &Way) -> Option<(u8, f32, bool)> {
     let tags: Vec<(&str, &str)> = w.tags().collect();
 
     // Helper that returns the first value associated with a given key.
-    let get = |key: &str| tags.iter().find_map(|(k, v)| if *k == key { Some(*v) } else { None });
+    let get = |key: &str| {
+        tags.iter()
+            .find_map(|(k, v)| if *k == key { Some(*v) } else { None })
+    };
 
     // ----- Buildings -------------------------------------------------------
     if let Some(building) = get("building") {
@@ -637,6 +630,32 @@ impl RTreeObject for TileBox {
     }
 }
 
+fn tiles_intersecting_geometry(
+    tree: &RTree<TileBox>,
+    coords: &[(f64, f64)],
+    padding_m: f64,
+) -> Vec<u32> {
+    if coords.is_empty() {
+        return Vec::new();
+    }
+    let mut low = [f64::INFINITY; 2];
+    let mut high = [f64::NEG_INFINITY; 2];
+    for &(lon, lat) in coords {
+        low[0] = low[0].min(lon);
+        low[1] = low[1].min(lat);
+        high[0] = high[0].max(lon);
+        high[1] = high[1].max(lat);
+    }
+    let (dy, dx) = pad_degrees_for((low[1] + high[1]) * 0.5, padding_m * 1.01);
+    low[0] -= dx;
+    low[1] -= dy;
+    high[0] += dx;
+    high[1] += dy;
+    tree.locate_in_envelope_intersecting(&AABB::from_corners(low, high))
+        .map(|tile| tile.idx)
+        .collect()
+}
+
 fn build_osm_overlays(
     pbf_path: &str,
     tiles: &[WorkItem],
@@ -661,10 +680,7 @@ fn build_osm_overlays(
         .enumerate()
         .map(|(idx, tile)| {
             let bbox = tile.bbox.unwrap(); // safe – validated above
-            let (pad_lat, pad_lon) = pad_degrees_for(
-                0.5 * (bbox.lat_min + bbox.lat_max),
-                margin_m,
-            );
+            let (pad_lat, pad_lon) = pad_degrees_for(0.5 * (bbox.lat_min + bbox.lat_max), margin_m);
             TileBox {
                 idx: idx as u32,
                 env: AABB::from_corners(
@@ -687,7 +703,8 @@ fn build_osm_overlays(
     };
 
     // --------------------------------------------------------------------
-    // First pass: read all nodes, keep those that intersect any tile.
+    // Keep complete way geometry. A polygon may cover a tile while every
+    // vertex lies outside it; clipping the node set corrupts polygon topology.
     // --------------------------------------------------------------------
     let mut node_map: hashbrown::HashMap<i64, NodeRec, nohash_hasher::BuildNoHashHasher<i64>> =
         hashbrown::HashMap::with_hasher(nohash_hasher::BuildNoHashHasher::default());
@@ -705,23 +722,7 @@ fn build_osm_overlays(
 
         seen_nodes += 1;
 
-        // Determine which tiles contain this node.
-        let mut touching_tiles = SmallVec::<[u32; 4]>::new();
-        for tb in tile_tree.locate_in_envelope_intersecting(&AABB::from_point([lon, lat])) {
-            touching_tiles.push(tb.idx);
-        }
-
-        // Keep the node only if it belongs to at least one tile.
-        if !touching_tiles.is_empty() {
-            node_map.insert(
-                id,
-                NodeRec {
-                    lon,
-                    lat,
-                    tiles: touching_tiles,
-                },
-            );
-        }
+        node_map.insert(id, NodeRec { lon, lat });
 
         // Periodic progress report.
         if tick.should(seen_nodes) {
@@ -748,33 +749,34 @@ fn build_osm_overlays(
 
             // Classify the way and obtain its rendering parameters.
             if let Some((class_id, width_m, is_area)) = classify_way(&way) {
-                // Gather coordinates for all referenced nodes that are present in
-                // our node_map, and collect the set of tiles the way touches.
-                let mut coords = Vec::with_capacity(way.refs().len());
-                let mut touched_tiles = SmallVec::<[u32; 8]>::new();
-
-                for node_ref in way.refs() {
-                    if let Some(node) = node_map.get(&node_ref) {
-                        coords.push((node.lon, node.lat));
-                        for &ti in &node.tiles {
-                            if !touched_tiles.contains(&ti) {
-                                touched_tiles.push(ti);
-                            }
-                        }
-                    }
-                }
+                // All referenced nodes are required. Never connect across a
+                // missing vertex or assign polygons only to vertex-containing tiles.
+                let coords: Option<Vec<_>> = way
+                    .refs()
+                    .map(|id| node_map.get(&id).map(|node| (node.lon, node.lat)))
+                    .collect();
+                let Some(coords) = coords else {
+                    return;
+                };
+                let touched_tiles =
+                    tiles_intersecting_geometry(&tile_tree, &coords, width_m as f64 * 0.5 + 1.0);
 
                 // We need at least two points for a line or three for a polygon.
-                let enough_coords = if is_area { coords.len() >= 3 } else { coords.len() >= 2 };
+                let enough_coords = if is_area {
+                    coords.len() >= 3
+                } else {
+                    coords.len() >= 2
+                };
                 if enough_coords && !touched_tiles.is_empty() {
                     let coords_arc = Arc::new(coords);
                     for tile_idx in touched_tiles {
                         let tile = &tiles[tile_idx as usize];
                         let entry = overlays.entry(tile.prefix.clone()).or_default();
                         if is_area {
-                            entry
-                                .areas
-                                .push(Polygon { class: class_id, ring: coords_arc.clone() });
+                            entry.areas.push(Polygon {
+                                class: class_id,
+                                ring: coords_arc.clone(),
+                            });
                         } else {
                             entry.roads.push(Polyline {
                                 class: class_id,
@@ -887,11 +889,10 @@ fn clamp_i(v: i32, lo: i32, hi: i32) -> i32 {
 /// Convert normalized UV coordinates (0.0 to 1.0) to pixel coordinates.
 #[inline]
 fn uv_to_pixel(u: f32, v: f32, w: u16, h: u16) -> (i32, i32) {
-    let u_clamped = u.clamp(0.0, 1.0);
-    let v_clamped = v.clamp(0.0, 1.0);
-
-    let x = (u_clamped * (w as f32 - 1.0)).round() as i32;
-    let y = (v_clamped * (h as f32 - 1.0)).round() as i32;
+    // Clip raster iteration, not geometry vertices: clamping outside vertices
+    // creates artificial roads/polygon edges along the tile perimeter.
+    let x = (u * (w as f32 - 1.0)).round() as i32;
+    let y = (v * (h as f32 - 1.0)).round() as i32;
 
     (x, y)
 }
@@ -944,8 +945,7 @@ fn rasterize_polygon(mask: &mut SemMask, poly: &[(i32, i32)], class: u8) {
                 // Edge crosses the horizontal line at y?
                 if (yi > y) != (yj > y) {
                     // Compute the x‑coordinate of the intersection.
-                    let x_inter = (xj - xi) as f32
-                        * ((y - yi) as f32 / ((yj - yi) as f32 + 1e-20))
+                    let x_inter = (xj - xi) as f32 * ((y - yi) as f32 / ((yj - yi) as f32 + 1e-20))
                         + xi as f32;
 
                     if (x as f32) < x_inter {
@@ -971,12 +971,7 @@ fn sqr(x: f32) -> f32 {
 /// Rasterises a polyline onto the semantic mask, expanding it by a
 /// radius (in pixels) and writing the given class to any covered
 /// pixels.
-fn rasterize_polyline(
-    mask: &mut SemMask,
-    line: &[(i32, i32)],
-    radius_px: f32,
-    class: u8,
-) {
+fn rasterize_polyline(mask: &mut SemMask, line: &[(i32, i32)], radius_px: f32, class: u8) {
     // Need at least a start and end point to form a segment.
     if line.len() < 2 {
         return;
@@ -1029,18 +1024,14 @@ fn rasterize_polyline(
     }
 }
 
-fn build_smc1_mask(
-    overlay: &SemOverlayPerTile,
-    tile_bbox_deg: GeoBboxDeg,
-    grid: u16,
-) -> SemMask {
+fn build_smc1_mask(overlay: &SemOverlayPerTile, tile_bbox_deg: GeoBboxDeg, grid: u16) -> SemMask {
     // --------------------------------------------------------------------
     // Initialise an empty mask – one-byte per pixel, initially all zero.
     // --------------------------------------------------------------------
     let mut mask = SemMask {
         w: grid,
         h: grid,
-        data: vec![0u8; (grid as usize).pow(2)],
+        data: vec![SemClass::Unknown as u8; (grid as usize).pow(2)],
     };
 
     // --------------------------------------------------------------------
@@ -1099,52 +1090,6 @@ fn build_smc1_mask(
 
 // ---------- Input CS detection and safe quantization ----------
 
-/// Heuristic to decide how OBJ vertex coordinates should be interpreted.
-fn detect_input_cs(sample: &[[f64; 3]]) -> InputCs {
-    // --------------------------------------------------------------------
-    // 1  Count how many vertices appear to be geographic (lon/lat) values.
-    // --------------------------------------------------------------------
-    let sample_len = sample.len().max(1);
-    let sample_len_f64 = sample_len as f64;
-
-    let geo_like = sample
-        .iter()
-        .filter(|p| p[0].abs() <= 180.0 && p[1].abs() <= 90.0)
-        .count();
-
-    // If at least 90% of the vertices are within geographic bounds, treat as
-    // geodetic coordinates.
-    if (geo_like as f64) / sample_len_f64 >= 0.90 {
-        return InputCs::Geodetic;
-    }
-
-    // --------------------------------------------------------------------
-    // 2   Try to recognise Earth‑Centered‑Earth‑Fixed (ECEF) coordinates.
-    //     We look at the mean distance from the origin and compare it with the
-    //     typical Earth radius (+‑ a generous margin for height / noise).
-    // --------------------------------------------------------------------
-    const ECEF_MIN: f64 = 6_200_000.0; // metres
-    const ECEF_MAX: f64 = 6_500_000.0; // metres
-    const MAX_SAMPLES: usize = 4_096;
-
-    let take = sample_len.min(MAX_SAMPLES);
-    let radius_sum: f64 = sample
-        .iter()
-        .take(take)
-        .map(|p| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt())
-        .sum();
-
-    let radius_mean = radius_sum / take as f64;
-    if radius_mean.is_finite() && (ECEF_MIN..=ECEF_MAX).contains(&radius_mean) {
-        return InputCs::Ecef;
-    }
-
-    // --------------------------------------------------------------------
-    // 3   Default to a generic local meter‑based coordinate system.
-    // --------------------------------------------------------------------
-    InputCs::LocalM
-}
-
 #[derive(Debug, Clone)]
 struct Quantized {
     /// Anchor point expressed in integer units.
@@ -1157,15 +1102,25 @@ struct Quantized {
 
 /// Quantize to integer lattice with an anchor, automatically down‑scaling
 /// `units_per_meter` (UPM) to fit into an `i32` if necessary.
-fn quantize_with_anchor(points_m: &[[f64; 3]], requested_upm: u32) -> Quantized {
-    debug_assert!(!points_m.is_empty());
+fn quantize_with_anchor(points_m: &[[f64; 3]], requested_upm: u32) -> Result<Quantized> {
+    anyhow::ensure!(!points_m.is_empty(), "Cannot quantize an empty cloud");
+    anyhow::ensure!(requested_upm > 0, "units_per_meter must be positive");
+    anyhow::ensure!(
+        points_m
+            .iter()
+            .flatten()
+            .all(|v| v.is_finite() && (v * requested_upm as f64).abs() < i64::MAX as f64 / 2.0),
+        "Coordinate is non-finite or outside the integer lattice range"
+    );
 
     // ------------------------------------------------------------------------
     // 1  Compute the centroid (anchor) in metres.
     // ------------------------------------------------------------------------
-    let (sum_x, sum_y, sum_z) = points_m.iter().fold((0.0_f64, 0.0_f64, 0.0_f64), |(ax, ay, az), p| {
-        (ax + p[0], ay + p[1], az + p[2])
-    });
+    let (sum_x, sum_y, sum_z) = points_m
+        .iter()
+        .fold((0.0_f64, 0.0_f64, 0.0_f64), |(ax, ay, az), p| {
+            (ax + p[0], ay + p[1], az + p[2])
+        });
     let inv_n = 1.0_f64 / points_m.len() as f64;
     let anchor_m = [sum_x * inv_n, sum_y * inv_n, sum_z * inv_n];
 
@@ -1253,6 +1208,10 @@ fn quantize_with_anchor(points_m: &[[f64; 3]], requested_upm: u32) -> Quantized 
         match try_quantize(points_m, upm, anchor_units) {
             Some(v) => break v,
             None => {
+                anyhow::ensure!(
+                    upm > 1,
+                    "Tile span exceeds i32 offsets even at one unit per metre"
+                );
                 // Reduce UPM (add safety margin) and recompute anchor units.
                 upm = ((upm as f64) * 0.5).floor().max(1.0) as u32;
                 warn!("Further reduced units_per_meter to {} for safety.", upm);
@@ -1269,11 +1228,11 @@ fn quantize_with_anchor(points_m: &[[f64; 3]], requested_upm: u32) -> Quantized 
     // ------------------------------------------------------------------------
     // 7  Assemble the result.
     // ------------------------------------------------------------------------
-    Quantized {
+    Ok(Quantized {
         anchor_units,
         points_units,
         used_upm: upm,
-    }
+    })
 }
 
 fn process_one_mesh(
@@ -1297,8 +1256,10 @@ fn process_one_mesh(
     ));
 
     if out_path.exists() && !args.overwrite {
-        debug!("Skipping existing file: {}", out_path.display());
-        return Ok(());
+        anyhow::bail!(
+            "{} already exists; use --overwrite to regenerate with the selected CRS",
+            out_path.display()
+        );
     }
 
     info!("Processing {} -> {}", path.display(), out_path.display());
@@ -1307,7 +1268,10 @@ fn process_one_mesh(
     // Load raw OBJ vertices (supports plain .obj or .zip containing a single .obj)
     // ---------------------------------------------------------------------
     debug!("Loading vertices from {}", path.display());
-    let raw_xyz: Vec<[f64; 3]> = if path.extension().and_then(|s| s.to_str()) == Some("zip") {
+    let surface::Mesh {
+        vertices: raw_xyz,
+        triangles,
+    } = if path.extension().and_then(|s| s.to_str()) == Some("zip") {
         debug!("Opening ZIP archive");
         let file = File::open(path)?;
 
@@ -1316,15 +1280,19 @@ fn process_one_mesh(
         let obj_name = archive
             .file_names()
             .find(|n| n.to_ascii_lowercase().ends_with(".obj"))
-            .context("No .obj file found in zip archive")?.to_owned();
+            .context("No .obj file found in zip archive")?
+            .to_owned();
 
         debug!("Found OBJ file in ZIP: {}", obj_name);
         let mut obj_file = archive.by_name(&obj_name)?;
 
-        parse_obj_vertices(&mut obj_file)?
+        surface::read_obj(&mut obj_file, matches!(args.sampling, Sampling::Surface))?
     } else {
         debug!("Opening OBJ file directly");
-        parse_obj_vertices(File::open(path)?)?
+        surface::read_obj(
+            File::open(path)?,
+            matches!(args.sampling, Sampling::Surface),
+        )?
     };
 
     if raw_xyz.is_empty() {
@@ -1338,14 +1306,11 @@ fn process_one_mesh(
     // Determine coordinate system (auto‑detect if requested)
     // ---------------------------------------------------------------------
     let cs = match args.input_cs {
-        InputCs::Auto => {
-            debug!("Auto-detecting coordinate system from {} sample vertices", raw_xyz.len().min(4096));
-            let sample_len = raw_xyz.len().min(4096);
-            let guess = detect_input_cs(&raw_xyz[..sample_len]);
-
-            info!("Input CS (auto‑detected): {guess}");
-            guess
-        }
+        InputCs::Auto if args.source_crs.is_some() => InputCs::Projected,
+        InputCs::Auto => anyhow::bail!(
+            "Coordinate ranges cannot determine a CRS. Supply --source-crs for projected data \
+             or explicitly select --input-cs geodetic / ecef."
+        ),
         forced => {
             debug!("Using forced coordinate system: {forced}");
             info!("Input CS (forced): {forced}");
@@ -1356,7 +1321,11 @@ fn process_one_mesh(
     // ---------------------------------------------------------------------
     // Convert vertices to ECEF metres and optionally track lon/lat bounds
     // ---------------------------------------------------------------------
-    debug!("Converting {} vertices from {:?} to ECEF", raw_xyz.len(), cs);
+    debug!(
+        "Converting {} vertices from {:?} to ECEF",
+        raw_xyz.len(),
+        cs
+    );
     let mut points_m = Vec::with_capacity(raw_xyz.len());
     let mut lon_min = f64::INFINITY;
     let mut lon_max = f64::NEG_INFINITY;
@@ -1365,20 +1334,39 @@ fn process_one_mesh(
 
     match cs {
         InputCs::Geodetic => {
-            debug!("Processing {} geodetic coordinates (lon, lat, height)", raw_xyz.len());
+            debug!(
+                "Processing {} geodetic coordinates (lon, lat, height)",
+                raw_xyz.len()
+            );
             for &[lon, lat, h_m] in &raw_xyz {
                 lon_min = lon_min.min(lon);
                 lon_max = lon_max.max(lon);
                 lat_min = lat_min.min(lat);
                 lat_max = lat_max.max(lat);
-                points_m.push(geodetic_to_ecef(lat, lon, h_m));
+                anyhow::ensure!(
+                    (-180.0..=180.0).contains(&lon) && (-90.0..=90.0).contains(&lat),
+                    "Invalid geodetic coordinate"
+                );
+                points_m.push(geodetic_to_ecef(lat, lon, h_m + args.height_offset_m));
             }
-            debug!("Geodetic bounds: lon=[{:.6}, {:.6}], lat=[{:.6}, {:.6}]", lon_min, lon_max, lat_min, lat_max);
-            debug!("Height range: [{:.3}, {:.3}]m",
-                   raw_xyz.iter().map(|p| p[2]).fold(f64::INFINITY, f64::min),
-                   raw_xyz.iter().map(|p| p[2]).fold(f64::NEG_INFINITY, f64::max));
+            debug!(
+                "Geodetic bounds: lon=[{:.6}, {:.6}], lat=[{:.6}, {:.6}]",
+                lon_min, lon_max, lat_min, lat_max
+            );
+            debug!(
+                "Height range: [{:.3}, {:.3}]m",
+                raw_xyz.iter().map(|p| p[2]).fold(f64::INFINITY, f64::min),
+                raw_xyz
+                    .iter()
+                    .map(|p| p[2])
+                    .fold(f64::NEG_INFINITY, f64::max)
+            );
         }
         InputCs::Ecef => {
+            anyhow::ensure!(
+                args.height_offset_m == 0.0,
+                "height-offset-m applies only to projected/geodetic input"
+            );
             debug!("Using {} ECEF coordinates directly", raw_xyz.len());
             points_m.extend(raw_xyz.iter().copied());
 
@@ -1387,117 +1375,94 @@ fn process_one_mesh(
             let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
             let (mut min_z, mut max_z) = (f64::INFINITY, f64::NEG_INFINITY);
             for &[x, y, z] in &raw_xyz {
-                min_x = min_x.min(x); max_x = max_x.max(x);
-                min_y = min_y.min(y); max_y = max_y.max(y);
-                min_z = min_z.min(z); max_z = max_z.max(z);
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+                min_z = min_z.min(z);
+                max_z = max_z.max(z);
             }
-            debug!("ECEF bounds: X=[{:.1}, {:.1}], Y=[{:.1}, {:.1}], Z=[{:.1}, {:.1}]m",
-                   min_x, max_x, min_y, max_y, min_z, max_z);
-        }
-        InputCs::LocalM => {
-            debug!("Converting {} local ENU coordinates to ECEF", raw_xyz.len());
-
-            // Local ENU coordinates – requires a geographic bounding box.
-            let bbox =
-                bbox.context("LocalM coordinate system needs a bbox (provide --feature-index)")?;
-
-            debug!("Using tile bbox: lon=[{:.6}, {:.6}], lat=[{:.6}, {:.6}]",
-                   bbox.lon_min, bbox.lon_max, bbox.lat_min, bbox.lat_max);
-
-            // Geographic centre of the tile.
-            let lat_c = (bbox.lat_min + bbox.lat_max) * 0.5;
-            let lon_c = (bbox.lon_min + bbox.lon_max) * 0.5;
-
-            // Calculate local coordinate bounds for debugging
-            let (mut min_x, mut max_x) = (f64::INFINITY, f64::NEG_INFINITY);
-            let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
-
-            for &[x, y, _] in &raw_xyz {
-                min_x = min_x.min(x); max_x = max_x.max(x);
-                min_y = min_y.min(y); max_y = max_y.max(y);
-            }
-
-            // Derive a planar origin so large UTM-like values become small offsets
-            let e0 = 0.5 * (min_x + max_x);
-            let n0 = 0.5 * (min_y + max_y);
-
             debug!(
-                "Local planar origin (E0,N0)=({:.2}, {:.2}) m",
-                e0, n0
+                "ECEF bounds: X=[{:.1}, {:.1}], Y=[{:.1}, {:.1}], Z=[{:.1}, {:.1}]m",
+                min_x, max_x, min_y, max_y, min_z, max_z
             );
-
-            // --- GEOMETRIC CORRECTION FOR EARTH CURVATURE ---
-
-            // Calculate radii of curvature at the tile's center latitude.
-            let lat_c_rad = lat_c.to_radians();
-            let (sin_lat_c, cos_lat_c) = lat_c_rad.sin_cos();
-
-            let a = hypc::wgs84::A;
-            let e2 = hypc::wgs84::E2;
-
-            let denom = (1.0 - e2 * sin_lat_c * sin_lat_c).sqrt();
-
-            // Prime vertical radius of curvature (for East-West distances)
-            let n = a / denom;
-
-            // Meridional radius of curvature (for North-South distances)
-            let m = a * (1.0 - e2) / (denom * denom * denom);
-
-            // Conversion factors from meters to degrees.
-            let meters_to_deg_lat = (1.0 / m).to_degrees();
-            let meters_to_deg_lon = (1.0 / (n * cos_lat_c)).to_degrees();
-
-            // Transform each point by calculating its precise geodetic coordinate
-            // and then converting to ECEF. This replaces the flawed tangent
-            // plane approximation.
-            for &[x_e, y_n, z_u] in &raw_xyz {
-                // Planar offsets from the tile's local origin
-                let xe = x_e - e0;
-                let yn = y_n - n0;
-
-                // Convert meter offsets to latitude/longitude degree offsets
-                let d_lat = yn * meters_to_deg_lat;
-                let d_lon = xe * meters_to_deg_lon;
-
-                // Calculate the point's true geodetic coordinate
-                let point_lat = lat_c + d_lat;
-                let point_lon = lon_c + d_lon;
-                let point_h = z_u; // Assume z_u is height above ellipsoid
-
-                // Convert this precise geodetic coordinate to ECEF
-                points_m.push(geodetic_to_ecef(point_lat, point_lon, point_h));
-            }
-
-            debug!("Successfully transformed {} ENU coordinates to ECEF with curvature correction", raw_xyz.len());
         }
+        InputCs::Projected => {
+            let crs = args
+                .source_crs
+                .as_deref()
+                .context("Projected coordinates require --source-crs (Berlin mesh: EPSG:25833)")?;
+            let transform = coordinates::ProjectedTransform::new(crs, args.height_offset_m)?;
+            for &p in &raw_xyz {
+                let (ecef, lon, lat) = transform.convert(p)?;
+                lon_min = lon_min.min(lon);
+                lon_max = lon_max.max(lon);
+                lat_min = lat_min.min(lat);
+                lat_max = lat_max.max(lat);
+                points_m.push(ecef);
+            }
+        }
+        InputCs::LocalM => anyhow::bail!(
+            "Unreferenced local coordinates cannot be placed from a tile bbox. \
+             For projected data use --input-cs projected --source-crs EPSG:25833; \
+             otherwise transform the source into geodetic or ECEF coordinates first."
+        ),
         InputCs::Auto => unreachable!(),
     }
 
     // ---------------------------------------------------------------------
     // Quantize coordinates with a safe units‑per‑meter value.
     // ---------------------------------------------------------------------
-    debug!("Quantizing with requested units_per_meter: {}", args.units_per_meter);
-    let q = quantize_with_anchor(&points_m, args.units_per_meter);
+    debug!(
+        "Quantizing with requested units_per_meter: {}",
+        args.units_per_meter
+    );
+    let source_vertices = points_m.len();
+    let points_m = match args.sampling {
+        Sampling::Vertices => points_m,
+        Sampling::Surface => surface::sample(&points_m, &triangles, args.surface_spacing_m)?,
+    };
+    let mut q = quantize_with_anchor(&points_m, args.units_per_meter)?;
+    if matches!(args.sampling, Sampling::Surface) {
+        q.points_units.sort_unstable();
+        q.points_units.dedup();
+    }
 
     if q.used_upm != args.units_per_meter {
-        debug!("Quantization used reduced units_per_meter: {} -> {}", args.units_per_meter, q.used_upm);
+        debug!(
+            "Quantization used reduced units_per_meter: {} -> {}",
+            args.units_per_meter, q.used_upm
+        );
     }
-    debug!("Quantized {} points with anchor: [{}, {}, {}]",
-           q.points_units.len(), q.anchor_units[0], q.anchor_units[1], q.anchor_units[2]);
+    debug!(
+        "Quantized {} points with anchor: [{}, {}, {}]",
+        q.points_units.len(),
+        q.anchor_units[0],
+        q.anchor_units[1],
+        q.anchor_units[2]
+    );
 
     // ---------------------------------------------------------------------
     // Optional SMC1 semantic mask
     // ---------------------------------------------------------------------
     let smc1_opt = if args.write_smc1 {
         if let (Some(bb), Some(ov)) = (bbox, overlays) {
-            debug!("Building SMC1 semantic mask {}x{} with {} roads, {} areas",
-                   args.sem_grid, args.sem_grid, ov.roads.len(), ov.areas.len());
+            debug!(
+                "Building SMC1 semantic mask {}x{} with {} roads, {} areas",
+                args.sem_grid,
+                args.sem_grid,
+                ov.roads.len(),
+                ov.areas.len()
+            );
             let mask = build_smc1_mask(ov, bb, args.sem_grid);
             let (encoding, data) = if args.smc1_compress {
                 let compressed = smc1_encode_rle(&mask.data);
-                debug!("SMC1 RLE compression: {} -> {} bytes ({:.1}%)",
-                       mask.data.len(), compressed.len(),
-                       (compressed.len() as f64 / mask.data.len() as f64) * 100.0);
+                debug!(
+                    "SMC1 RLE compression: {} -> {} bytes ({:.1}%)",
+                    mask.data.len(),
+                    compressed.len(),
+                    (compressed.len() as f64 / mask.data.len() as f64) * 100.0
+                );
                 (Smc1Encoding::Rle, compressed)
             } else {
                 debug!("SMC1 using raw encoding: {} bytes", mask.data.len());
@@ -1510,9 +1475,7 @@ fn process_one_mesh(
                 coord_space: Smc1CoordSpace::Crs84BboxNorm,
                 encoding,
                 data,
-                palette: (0u8..=9u8)
-                    .map(|i| (i, class_precedence(i)))
-                    .collect(),
+                palette: (0u8..=9u8).map(|i| (i, class_precedence(i))).collect(),
             })
         } else {
             debug!("SMC1 requested but no bbox or overlays available");
@@ -1528,22 +1491,23 @@ fn process_one_mesh(
     // ---------------------------------------------------------------------
     let geot = if args.write_geot {
         if let Some(bb) = bbox {
-            debug!("Using GEOT from bbox: lon=[{:.6}, {:.6}], lat=[{:.6}, {:.6}]",
-                   bb.lon_min, bb.lon_max, bb.lat_min, bb.lat_max);
+            debug!(
+                "Using GEOT from bbox: lon=[{:.6}, {:.6}], lat=[{:.6}, {:.6}]",
+                bb.lon_min, bb.lon_max, bb.lat_min, bb.lat_max
+            );
             Some(GeoExtentQ7::from_deg(
-                bb.lon_min,
-                bb.lon_max,
-                bb.lat_min,
-                bb.lat_max,
+                bb.lon_min, bb.lon_max, bb.lat_min, bb.lat_max,
             ))
-        } else if matches!(cs, InputCs::Geodetic)
+        } else if matches!(cs, InputCs::Geodetic | InputCs::Projected)
             && lon_min.is_finite()
             && lon_max.is_finite()
             && lat_min.is_finite()
             && lat_max.is_finite()
         {
-            debug!("Using GEOT from computed bounds: lon=[{:.6}, {:.6}], lat=[{:.6}, {:.6}]",
-                   lon_min, lon_max, lat_min, lat_max);
+            debug!(
+                "Using GEOT from computed bounds: lon=[{:.6}, {:.6}], lat=[{:.6}, {:.6}]",
+                lon_min, lon_max, lat_min, lat_max
+            );
             Some(GeoExtentQ7::from_deg(lon_min, lon_max, lat_min, lat_max))
         } else {
             debug!("No GEOT information available");
@@ -1557,18 +1521,54 @@ fn process_one_mesh(
     // ---------------------------------------------------------------------
     // Assemble the HYPC tile and write it to disk
     // ---------------------------------------------------------------------
+    let labels = overlays.map(|overlay| {
+        let mut field = semantics::LabelField::new(overlay);
+        q.points_units
+            .iter()
+            .map(|p| {
+                let ecef: [f64; 3] = std::array::from_fn(|i| {
+                    (q.anchor_units[i] + p[i] as i64) as f64 / q.used_upm as f64
+                });
+                let (lat, lon, _) = hypc::ecef_to_geodetic(ecef[0], ecef[1], ecef[2]);
+                field.label(lon, lat)
+            })
+            .collect()
+    });
+
     let tile = HypcTile {
         units_per_meter: q.used_upm,
         anchor_ecef_units: q.anchor_units,
         tile_key: Some(tilekey_from_prefix(prefix)),
         points_units: q.points_units,
-        labels: None,
+        labels,
         geot,
         smc1: smc1_opt,
     };
 
     debug!("Writing HYPC tile to {}", out_path.display());
     hypc::write_file(&out_path, &tile)?;
+    let provenance = serde_json::json!({
+        "converter": "obj2hypc/shared-crs-surface-v2",
+        "sampling": format!("{:?}", args.sampling),
+        "source_vertices": source_vertices,
+        "source_triangles": triangles.len(),
+        "surface_spacing_m": if matches!(args.sampling, Sampling::Surface) { Some(args.surface_spacing_m) } else { None },
+        "source_path": path,
+        "input_cs": cs.to_string(),
+        "horizontal_source_crs": args.source_crs,
+        "height_policy": "source z + explicit dataset offset; no inferred vertical datum conversion",
+        "height_offset_m": args.height_offset_m,
+        "semantic_source_pbf": args.osm_pbf,
+        "semantic_geometry": "complete ways selected by intersecting buffered bounds",
+        "semantic_labels": "direct per-point labels on a global angular lattice",
+        "semantic_cell_degrees": semantics::CELL_DEG,
+        "units_per_meter": q.used_upm,
+        "points": tile.points_units.len(),
+    });
+    fs::write(
+        out_path.with_extension("provenance.json"),
+        serde_json::to_vec_pretty(&provenance)?,
+    )?;
 
     info!(
         "OK {} -> {} ({} pts, {} u/m)",
@@ -1586,6 +1586,18 @@ fn main() -> Result<()> {
 
     // Parse arguments and prepare output directory.
     let args = Args::parse();
+    anyhow::ensure!(!args.osm_prefilter,
+        "Vertex-based OSM prefiltering can omit polygons enclosing a tile; supply a complete regional PBF");
+    anyhow::ensure!(args.units_per_meter > 0, "units_per_meter must be positive");
+    anyhow::ensure!(
+        args.height_offset_m.is_finite(),
+        "height offset must be finite"
+    );
+    anyhow::ensure!(args.sem_grid > 0, "sem-grid must be positive");
+    anyhow::ensure!(
+        args.source_crs.is_none() || matches!(args.input_cs, InputCs::Auto | InputCs::Projected),
+        "source-crs applies only to projected input"
+    );
     fs::create_dir_all(&args.output_dir)?;
 
     // Index all OBJ/ZIP files in the input directory.
@@ -1630,12 +1642,15 @@ fn main() -> Result<()> {
         })
         .collect();
 
+    anyhow::ensure!(
+        !resolved_items.is_empty(),
+        "No source meshes matched the input selection"
+    );
+
     // Build semantic overlays once if an OSM PBF file was supplied.
     let overlays_map = if let Some(pbf_path) = &args.osm_pbf {
-        let overlay_items: Vec<WorkItem> = resolved_items
-            .iter()
-            .map(|ri| ri.item.clone())
-            .collect();
+        let overlay_items: Vec<WorkItem> =
+            resolved_items.iter().map(|ri| ri.item.clone()).collect();
 
         Some(Arc::new(build_osm_overlays(
             pbf_path,
@@ -1651,25 +1666,118 @@ fn main() -> Result<()> {
     info!("Processing {} items...", resolved_items.len());
 
     // Process meshes in parallel, reporting any errors.
-    resolved_items.par_iter().for_each(|resolved_item| {
-        let overlay = overlays_map
-            .as_ref()
-            .and_then(|map| map.get(&resolved_item.item.prefix));
+    resolved_items
+        .par_iter()
+        .try_for_each(|resolved_item| -> Result<()> {
+            let overlay = overlays_map
+                .as_ref()
+                .and_then(|map| map.get(&resolved_item.item.prefix));
 
-        if let Err(err) = process_one_mesh(
-            &resolved_item.path,
-            &args,
-            &resolved_item.item.prefix,
-            resolved_item.item.bbox,
-            overlay,
-        ) {
-            warn!(
-                "Error processing {}: {:#}",
-                resolved_item.path.display(),
-                err
-            );
-        }
-    });
+            process_one_mesh(
+                &resolved_item.path,
+                &args,
+                &resolved_item.item.prefix,
+                resolved_item.item.bbox,
+                overlay,
+            )
+            .with_context(|| format!("Processing {}", resolved_item.path.display()))
+        })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantics_cover_tiles_without_containing_any_way_vertex() {
+        let tree = RTree::bulk_load(vec![TileBox {
+            idx: 0,
+            env: AABB::from_corners([0.0, 0.0], [1.0, 1.0]),
+        }]);
+        let ring = vec![
+            (-1.0, -1.0),
+            (2.0, -1.0),
+            (2.0, 2.0),
+            (-1.0, 2.0),
+            (-1.0, -1.0),
+        ];
+        assert_eq!(tiles_intersecting_geometry(&tree, &ring, 0.0), vec![0]);
+        assert_eq!(
+            tiles_intersecting_geometry(&tree, &[(-1.0, 0.5), (2.0, 0.5)], 0.0),
+            vec![0]
+        );
+        let overlay = SemOverlayPerTile {
+            roads: vec![],
+            areas: vec![Polygon {
+                class: 6,
+                ring: Arc::new(ring),
+            }],
+        };
+        let mask = build_smc1_mask(
+            &overlay,
+            GeoBboxDeg {
+                lon_min: 0.0,
+                lon_max: 1.0,
+                lat_min: 0.0,
+                lat_max: 1.0,
+            },
+            16,
+        );
+        assert!(mask.data.iter().all(|&v| v == 6));
+    }
+
+    #[test]
+    fn off_tile_geometry_does_not_paint_the_tile_border() {
+        let line = vec![
+            uv_to_pixel(-1.0, -1.0, 16, 16),
+            uv_to_pixel(-1.0, 2.0, 16, 16),
+        ];
+        let mut mask = SemMask {
+            w: 16,
+            h: 16,
+            data: vec![0; 256],
+        };
+        rasterize_polyline(&mut mask, &line, 1.0, 2);
+        assert!(mask.data.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn partitioning_does_not_move_shared_points() {
+        let t = coordinates::ProjectedTransform::new("EPSG:25833", 0.0).unwrap();
+        let shared = t.convert([389700.0, 5819300.0, 42.0]).unwrap().0;
+        let west = t.convert([389400.0, 5819000.0, -5.0]).unwrap().0;
+        let east = t.convert([390000.0, 5819600.0, 170.0]).unwrap().0;
+        for upm in [1, 1000, 2000, 10000] {
+            let a = quantize_with_anchor(&[west, shared], upm).unwrap();
+            let b = quantize_with_anchor(&[shared, east, east, east], upm).unwrap();
+            assert_ne!(a.anchor_units, b.anchor_units);
+            for axis in 0..3 {
+                let pa = a.anchor_units[axis] + a.points_units[1][axis] as i64;
+                let pb = b.anchor_units[axis] + b.points_units[0][axis] as i64;
+                assert_eq!(pa, pb, "Shared global lattice coordinate differs");
+                assert!((pa as f64 / upm as f64 - shared[axis]).abs() <= 0.5 / upm as f64 + 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_quantization_fails_without_hanging_or_clamping() {
+        assert!(quantize_with_anchor(&[], 1000).is_err());
+        assert!(quantize_with_anchor(&[[0.0; 3]], 0).is_err());
+        assert!(quantize_with_anchor(&[[f64::NAN; 3]], 1000).is_err());
+        assert!(quantize_with_anchor(&[[-3e9; 3], [3e9; 3]], 1).is_err());
+        let q = quantize_with_anchor(&[[-3e6; 3], [3e6; 3]], 1000).unwrap();
+        assert!(q.used_upm < 1000);
+    }
+
+    #[test]
+    fn obj_whitespace_and_nonfinite_vertices() {
+        assert_eq!(
+            parse_obj_vertices("v\t1 2 3\n".as_bytes()).unwrap(),
+            vec![[1.0, 2.0, 3.0]]
+        );
+        assert!(parse_obj_vertices("v NaN 2 3\n".as_bytes()).is_err());
+    }
 }

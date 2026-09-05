@@ -7,7 +7,9 @@ pub mod targets;
 
 use self::{
     context::GfxContext,
-    pipelines::{ground_grid::GroundGridPipeline, hologram::HologramPipeline, post_stack::PostStack},
+    pipelines::{
+        ground_grid::GroundGridPipeline, hologram::HologramPipeline, post_stack::PostStack,
+    },
     targets::Targets,
 };
 use crate::{camera::Camera, data::types::TileGpu};
@@ -44,8 +46,7 @@ impl Renderer {
         );
         let post_stack = PostStack::new(&gfx.device, gfx.config.format, size.width, size.height);
 
-        let egui_renderer =
-            egui_wgpu::Renderer::new(&gfx.device, gfx.config.format, None, 1);
+        let egui_renderer = egui_wgpu::Renderer::new(&gfx.device, gfx.config.format, None, 1);
 
         Ok(Self {
             gfx,
@@ -61,16 +62,12 @@ impl Renderer {
         if new_size.width > 0 && new_size.height > 0 {
             self.gfx.resize(new_size);
             self.targets.resize(&self.gfx.device, new_size);
-            self.post_stack.resize(&self.gfx.device, new_size.width, new_size.height);
+            self.post_stack
+                .resize(&self.gfx.device, new_size.width, new_size.height);
         }
     }
 
-    pub fn render(
-        &mut self,
-        swap_view: &wgpu::TextureView,
-        tiles: &[TileGpu],
-        camera: &Camera,
-    ) {
+    pub fn render(&mut self, swap_view: &wgpu::TextureView, tiles: &[TileGpu], camera: &Camera) {
         let mut encoder = self
             .gfx
             .device
@@ -87,7 +84,12 @@ impl Renderer {
                         view: &self.targets.color,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                     }),
@@ -95,7 +97,12 @@ impl Renderer {
                         view: &self.targets.dlin,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 0.0 }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                     }),
